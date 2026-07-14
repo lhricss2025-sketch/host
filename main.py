@@ -24,6 +24,36 @@ from flask import Flask
 from threading import Thread
 
 # ============================================
+# TURSO DATABASE SETUP
+# ============================================
+
+# Try to import Turso
+try:
+    import libsql_experimental as libsql
+    TURSO_AVAILABLE = True
+except ImportError:
+    TURSO_AVAILABLE = False
+    print("⚠️ Turso not installed, using local SQLite")
+
+# Get Turso credentials from environment variables (Railway)
+TURSO_URL = os.environ.get('TURSO_URL', '')
+TURSO_TOKEN = os.environ.get('TURSO_TOKEN', '')
+
+def get_db_connection():
+    """Get database connection (Turso or fallback to local SQLite)"""
+    if TURSO_AVAILABLE and TURSO_URL and TURSO_TOKEN:
+        try:
+            conn = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
+            print("✅ Connected to Turso database!")
+            return conn
+        except Exception as e:
+            print(f"❌ Turso connection failed: {e}")
+            print("⚠️ Falling back to local SQLite...")
+            return sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    else:
+        return sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+
+# ============================================
 # CONFIGURATION
 # ============================================
 
@@ -41,10 +71,10 @@ BRAND_EMOJI = "🐺"
 # 🖼️ START IMAGE CONFIGURATION
 # ============================================
 
-# Default banner (change to your image URL)
-START_IMAGE_URL = "https://i.postimg.cc/Jn3JGHwS/cvn-on-Tik-Tok.jpg"
+# Default banner (change using /setbanner command)
+START_IMAGE_URL = "https://i.postimg.cc/your-image.jpg"
 
-# Default description
+# Default description (change using /setdesc command)
 START_DESCRIPTION = """
 🚀 <b>Upload & Host Your Bots</b>
 📤 <b>Supported:</b> Python • Node.js • ZIP
@@ -116,12 +146,12 @@ def keep_alive():
     print(f"✅ Flask Keep-Alive server started for {BRAND_NAME}.")
 
 # ============================================
-# DATABASE FUNCTIONS
+# DATABASE FUNCTIONS (Turso + Fallback)
 # ============================================
 
 def init_db():
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        conn = get_db_connection()
         c = conn.cursor()
         
         c.execute('''CREATE TABLE IF NOT EXISTS subscriptions
@@ -177,7 +207,7 @@ def init_db():
 
 def load_data():
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        conn = get_db_connection()
         c = conn.cursor()
         
         c.execute('SELECT user_id, expiry FROM subscriptions')
@@ -206,7 +236,7 @@ def load_data():
 
 def log_action(user_id, action, details):
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('''INSERT INTO bot_logs (user_id, action, details, timestamp)
         VALUES (?, ?, ?, ?)''', (user_id, action, details, datetime.now().isoformat()))
@@ -217,7 +247,7 @@ def log_action(user_id, action, details):
 
 def save_user_file_db(user_id, file_name, file_type, file_size=0):
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('''INSERT OR REPLACE INTO user_files
         (user_id, file_name, file_type, upload_time, file_size)
@@ -231,7 +261,7 @@ def save_user_file_db(user_id, file_name, file_type, file_size=0):
 
 def remove_user_file_db(user_id, file_name):
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('DELETE FROM user_files WHERE user_id = ? AND file_name = ?', (user_id, file_name))
         conn.commit()
@@ -242,7 +272,7 @@ def remove_user_file_db(user_id, file_name):
 
 def save_active_user(user_id, username=None):
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        conn = get_db_connection()
         c = conn.cursor()
         now = datetime.now().isoformat()
         c.execute('''INSERT INTO active_users (user_id, username, first_seen, last_seen)
@@ -256,7 +286,7 @@ def save_active_user(user_id, username=None):
 
 def save_subscription(user_id, expiry):
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('INSERT OR REPLACE INTO subscriptions (user_id, expiry) VALUES (?, ?)',
         (user_id, expiry.isoformat()))
@@ -275,7 +305,7 @@ def get_user_referral_link(user_id):
 
 def initialize_user_points(user_id):
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('SELECT user_id FROM user_points WHERE user_id = ?', (user_id,))
         if c.fetchone():
@@ -290,7 +320,7 @@ def initialize_user_points(user_id):
 
 def get_user_points(user_id):
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('SELECT points, total_referrals FROM user_points WHERE user_id = ?', (user_id,))
         result = c.fetchone()
@@ -303,7 +333,7 @@ def get_user_points(user_id):
 
 def add_points(user_id, points, reason="Referral"):
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('''UPDATE user_points 
                      SET points = points + ?, 
@@ -328,7 +358,12 @@ def get_user_max_bots(user_id):
     extra_bots = points // 5
     if user_id == OWNER_ID or user_id in admin_ids:
         return float('inf')
-    return base_limit + extra_bots
+    
+    # Check subscription
+    if user_id in user_subscriptions and user_subscriptions[user_id]['expiry'] > datetime.now():
+        return SUBSCRIBED_USER_LIMIT
+    
+    return min(base_limit + extra_bots, FREE_USER_LIMIT)
 
 def get_current_bot_count(user_id):
     return len(user_files.get(user_id, []))
@@ -349,7 +384,7 @@ def process_referral_link(referred_user_id, referrer_id):
         if referrer_id == referred_user_id:
             return False, "❌ You can't refer yourself!"
         
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        conn = get_db_connection()
         c = conn.cursor()
         
         c.execute('SELECT id FROM referrals WHERE referred_user_id = ?', (referred_user_id,))
@@ -398,7 +433,7 @@ Keep sharing your referral link! 🚀
 
 def get_referral_stats(user_id):
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('SELECT COUNT(*) FROM referrals WHERE referrer_id = ?', (user_id,))
         total_refs = c.fetchone()[0]
@@ -459,7 +494,7 @@ def create_system_stats_message():
     running_bots = len([k for k, v in bot_scripts.items() if v.get('process') and is_bot_running_check(k)])
     
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('SELECT SUM(points) FROM user_points')
         total_points = c.fetchone()[0] or 0
@@ -897,7 +932,7 @@ def get_main_keyboard(user_id):
         markup.row("⭐ My Points", "🎯 Referral System")
         markup.row("💳 Subscriptions", "📢 Broadcast")
         markup.row("🔒 Lock Bot", "👑 Admin Panel")
-        markup.row("🖼️ Change Banner", "📞 Contact Owner")  # Admin only
+        markup.row("🖼️ Change Banner", "📞 Contact Owner")
     else:
         markup.row("📢 Updates Channel", "📤 Upload File")
         markup.row("📂 Check Files", "🟢 My Running Bots")
@@ -1595,7 +1630,7 @@ def show_admin_panel(message):
         return
     
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('SELECT COUNT(*) FROM user_points')
         total_users_with_points = c.fetchone()[0]
@@ -1782,7 +1817,7 @@ Each referral = 1 point ✨
     for i, (referred_id, timestamp) in enumerate(ref_stats['recent'][:10], 1):
         username = "Unknown"
         try:
-            conn = sqlite3.connect(DATABASE_PATH)
+            conn = get_db_connection()
             c = conn.cursor()
             c.execute('SELECT username FROM active_users WHERE user_id = ?', (referred_id,))
             result = c.fetchone()
@@ -2132,7 +2167,7 @@ Each referral = 1 point ✨
     for i, (referred_id, timestamp) in enumerate(ref_stats['recent'][:10], 1):
         username = "Unknown"
         try:
-            conn = sqlite3.connect(DATABASE_PATH)
+            conn = get_db_connection()
             c = conn.cursor()
             c.execute('SELECT username FROM active_users WHERE user_id = ?', (referred_id,))
             result = c.fetchone()
@@ -2419,7 +2454,7 @@ def show_all_user_files_for_admin(call):
         files_count = len(user_files[uid])
         username = "Unknown"
         try:
-            conn = sqlite3.connect(DATABASE_PATH)
+            conn = get_db_connection()
             c = conn.cursor()
             c.execute('SELECT username FROM active_users WHERE user_id = ?', (uid,))
             result = c.fetchone()
@@ -2469,7 +2504,7 @@ def show_admin_user_files(call, target_user):
     
     username = "Unknown"
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('SELECT username FROM active_users WHERE user_id = ?', (target_user,))
         result = c.fetchone()
@@ -2527,7 +2562,7 @@ def show_admin_file_actions(call, target_user, file_name):
     
     username = "Unknown"
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('SELECT username FROM active_users WHERE user_id = ?', (target_user,))
         result = c.fetchone()
@@ -2772,7 +2807,7 @@ def show_top_referrers(call):
         return
     
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('''SELECT user_id, points, total_referrals 
                      FROM user_points 
@@ -2797,7 +2832,7 @@ def show_top_referrers(call):
             
             username = "Unknown"
             try:
-                conn2 = sqlite3.connect(DATABASE_PATH)
+                conn2 = get_db_connection()
                 c2 = conn2.cursor()
                 c2.execute('SELECT username FROM active_users WHERE user_id = ?', (uid,))
                 result = c2.fetchone()
@@ -2855,7 +2890,7 @@ def show_admin_logs(call):
         bot.answer_callback_query(call.id, "❌ Admin only!")
         return
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute('SELECT user_id, action, details, timestamp FROM bot_logs ORDER BY id DESC LIMIT 20')
         logs = c.fetchall()
@@ -2900,7 +2935,7 @@ def main():
     
     logger.info(f"📁 Base Dir: {BASE_DIR}")
     logger.info(f"📁 Upload Dir: {UPLOAD_BOTS_DIR}")
-    logger.info(f"💾 Database: {DATABASE_PATH}")
+    logger.info(f"💾 Database: {'Turso' if TURSO_URL and TURSO_TOKEN else 'Local SQLite'}")
     logger.info("=" * 50)
     
     keep_alive()
