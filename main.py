@@ -54,7 +54,7 @@ def get_db_connection():
         return sqlite3.connect(DATABASE_PATH, check_same_thread=False)
 
 # ============================================
-# CONFIGURATION
+# CONFIGURATION (Environment Variables Se)
 # ============================================
 
 TOKEN = os.environ.get('BOT_TOKEN', '')
@@ -1835,32 +1835,56 @@ Each referral = 1 point ✨
     bot.send_message(message.chat.id, text, parse_mode='HTML')
 
 # ============================================
-# FILE UPLOAD HANDLER
+# FILE UPLOAD HANDLER (UPDATED)
 # ============================================
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     user_id = message.from_user.id
     
+    # Check if user can upload
     can_upload, status = can_user_upload(user_id)
     if not can_upload:
         bot.reply_to(message, f"❌ Can't upload! {status}")
-        return
-    
-    current_count = get_user_file_count(user_id)
-    limit = get_user_file_limit(user_id)
-    if current_count >= limit:
-        bot.reply_to(message, f"❌ File limit reached! ({current_count}/{int(limit) if limit != float('inf') else '∞'})")
         return
     
     file_name = message.document.file_name
     file_size = message.document.file_size
     file_ext = file_name.split('.')[-1].lower() if '.' in file_name else ''
     allowed_extensions = ['py', 'js', 'zip', 'json', 'txt', 'env', 'yml', 'yaml']
+    
     if file_ext not in allowed_extensions:
         bot.reply_to(message, f"❌ Unsupported type: .{file_ext}")
         return
     
+    # ============================================
+    # ZIP FILE = 1 SLOT CHECK
+    # ============================================
+    if file_ext == 'zip':
+        current_bots = get_current_bot_count(user_id)
+        max_bots = get_user_max_bots(user_id)
+        
+        if current_bots >= max_bots:
+            points_data = get_user_points(user_id)
+            needed = 5 - (points_data['points'] % 5)
+            bot.reply_to(message, f"""
+❌ <b>Can't Upload ZIP!</b>
+
+📊 <b>Your Status:</b>
+• Current Bots: {current_bots}
+• Max Bots: {max_bots}
+• Points: {points_data['points']}
+
+💡 <b>ZIP file counts as 1 bot slot!</b>
+Even if it contains multiple files.
+
+🎯 <b>You need {needed} more points!</b>
+""", parse_mode='HTML')
+            return
+    
+    # ============================================
+    # UPLOAD PROGRESS
+    # ============================================
     upload_text = f"""
 ╔══════════════════════════════════════╗
 ║      📤 <b>{BRAND_NAME}: UPLOADING</b> 📤     ║
@@ -1875,6 +1899,7 @@ def handle_document(message):
     try:
         file_info = bot.get_file(message.document.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
+        
         try:
             bot.edit_message_text(
                 upload_text + "║  📥 Processing...\n╚══════════════════════════════════════╝",
@@ -1886,60 +1911,201 @@ def handle_document(message):
         user_folder = get_user_folder(user_id)
         file_path = os.path.join(user_folder, file_name)
         
+        # ============================================
+        # ZIP FILE HANDLING
+        # ============================================
         if file_ext == 'zip':
             with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp:
                 tmp.write(downloaded_file)
                 tmp_path = tmp.name
+            
             try:
                 with zipfile.ZipFile(tmp_path, 'r') as zip_ref:
                     zip_ref.extractall(user_folder)
-                    extracted_files = []
-                    for root, dirs, files in os.walk(user_folder):
-                        for f in files:
-                            if f.endswith(('.py', '.js')):
-                                extracted_files.append(f)
-                                if user_id not in user_files:
-                                    user_files[user_id] = []
-                                if (f, f.split('.')[-1]) not in user_files[user_id]:
-                                    user_files[user_id].append((f, f.split('.')[-1]))
-                                    save_user_file_db(user_id, f, f.split('.')[-1], 0)
                     os.unlink(tmp_path)
-                    success_text = upload_text + f"""║  ✅ ZIP Extracted!
-║  📁 Files: {len(extracted_files)}
+                
+                # FIND ALL FILES
+                extracted_py_files = []
+                extracted_js_files = []
+                extracted_other_files = []
+                
+                for root, dirs, files in os.walk(user_folder):
+                    for f in files:
+                        if f.endswith('.py'):
+                            extracted_py_files.append(f)
+                        elif f.endswith('.js'):
+                            extracted_js_files.append(f)
+                        else:
+                            extracted_other_files.append(f)
+                
+                # SAVE ALL FILES TO DATABASE (1 SLOT)
+                if user_id not in user_files:
+                    user_files[user_id] = []
+                
+                all_files = extracted_py_files + extracted_js_files + extracted_other_files
+                for f in all_files:
+                    ftype = f.split('.')[-1] if '.' in f else 'txt'
+                    if (f, ftype) not in user_files[user_id]:
+                        user_files[user_id].append((f, ftype))
+                        save_user_file_db(user_id, f, ftype, 0)
+                
+                # AUTO-RUN FILES (LIMITED TO AVAILABLE SLOTS)
+                max_bots = get_user_max_bots(user_id)
+                current_bots = get_current_bot_count(user_id)
+                available_slots = max_bots - current_bots if max_bots != float('inf') else 999
+                
+                files_to_run = extracted_py_files + extracted_js_files
+                files_to_run = files_to_run[:available_slots]
+                
+                running_count = 0
+                failed_count = 0
+                running_files = []
+                failed_files = []
+                
+                for file_to_run in files_to_run:
+                    try:
+                        script_path = os.path.join(user_folder, file_to_run)
+                        if os.path.exists(script_path):
+                            ftype = file_to_run.split('.')[-1]
+                            if ftype == 'py':
+                                threading.Thread(
+                                    target=run_script,
+                                    args=(script_path, user_id, user_folder, file_to_run, message)
+                                ).start()
+                            elif ftype == 'js':
+                                threading.Thread(
+                                    target=run_js_script,
+                                    args=(script_path, user_id, user_folder, file_to_run, message)
+                                ).start()
+                            running_count += 1
+                            running_files.append(file_to_run)
+                            time.sleep(0.3)
+                    except Exception as e:
+                        failed_count += 1
+                        failed_files.append(file_to_run)
+                        logger.error(f"Failed to run {file_to_run}: {e}")
+                
+                # BUILD FILE LIST
+                file_list = ""
+                for f in all_files[:10]:
+                    ftype = f.split('.')[-1] if '.' in f else 'txt'
+                    icon = "🐍" if ftype == "py" else "🟨" if ftype == "js" else "📄"
+                    status_icon = "🟢" if f in running_files else "🔴"
+                    file_list += f"║  {status_icon} {icon} <code>{f[:25]}</code>\n"
+                
+                if len(all_files) > 10:
+                    file_list += f"║  ... and {len(all_files) - 10} more files\n"
+                
+                # SUCCESS MESSAGE
+                success_text = f"""
+╔══════════════════════════════════════╗
+║      ✅ <b>ZIP EXTRACTED & HOSTED!</b> ✅    ║
+╠══════════════════════════════════════╣
+║
+║  📁 <b>Total Files:</b> {len(all_files)}
+║  🐍 Python: {len(extracted_py_files)}
+║  🟨 JavaScript: {len(extracted_js_files)}
+║  📄 Other: {len(extracted_other_files)}
+║
+║  🚀 <b>Auto-Hosted:</b> {running_count} scripts
+║  ❌ <b>Failed:</b> {failed_count}
+║
+║  💡 <b>ZIP counts as 1 bot slot!</b>
+║  🤖 <b>Slots Used:</b> {current_bots + 1}/{max_bots if max_bots != float('inf') else '∞'}
+║
+╠══════════════════════════════════════╣
+{file_list}
 ╚══════════════════════════════════════╝
 """
+                
+                # INLINE BUTTONS
+                markup = types.InlineKeyboardMarkup(row_width=2)
+                markup.add(
+                    types.InlineKeyboardButton("📂 View All Files", callback_data="back_to_files"),
+                    types.InlineKeyboardButton("🟢 Running Bots", callback_data="view_running")
+                )
+                
+                if failed_count > 0:
+                    markup.add(types.InlineKeyboardButton("🔄 Retry Failed", callback_data=f"retry_failed_{user_id}"))
+                
+                if running_count > 0:
+                    markup.add(types.InlineKeyboardButton("🛑 Stop All", callback_data=f"stop_all_{user_id}"))
+                
+                try:
+                    bot.edit_message_text(success_text, message.chat.id, progress_msg.message_id,
+                                          parse_mode='HTML', reply_markup=markup)
+                except:
+                    bot.send_message(message.chat.id, success_text, parse_mode='HTML', reply_markup=markup)
+                
             except zipfile.BadZipFile:
                 bot.edit_message_text(
                     upload_text + "║  ❌ Invalid ZIP!\n╚══════════════════════════════════════╝",
                     message.chat.id, progress_msg.message_id, parse_mode='HTML'
                 )
                 return
+        
+        # ============================================
+        # SINGLE FILE HANDLING
+        # ============================================
         else:
+            # Check if user has slots
+            current_bots = get_current_bot_count(user_id)
+            max_bots = get_user_max_bots(user_id)
+            
+            if current_bots >= max_bots:
+                bot.edit_message_text(
+                    upload_text + f"║  ❌ No slots left!\n║  🤖 {current_bots}/{max_bots}\n╚══════════════════════════════════════╝",
+                    message.chat.id, progress_msg.message_id, parse_mode='HTML'
+                )
+                return
+            
             with open(file_path, 'wb') as f:
                 f.write(downloaded_file)
+            
             if user_id not in user_files:
                 user_files[user_id] = []
             user_files[user_id] = [(n, t) for n, t in user_files[user_id] if n != file_name]
             user_files[user_id].append((file_name, file_ext))
             save_user_file_db(user_id, file_name, file_ext, file_size)
-            success_text = upload_text + f"""║  ✅ Upload Complete!
+            
+            # Auto-run single file
+            running_msg = ""
+            if file_ext in ['py', 'js']:
+                try:
+                    if file_ext == 'py':
+                        threading.Thread(
+                            target=run_script,
+                            args=(file_path, user_id, user_folder, file_name, message)
+                        ).start()
+                    else:
+                        threading.Thread(
+                            target=run_js_script,
+                            args=(file_path, user_id, user_folder, file_name, message)
+                        ).start()
+                    running_msg = "\n  🚀 Script started automatically!"
+                except Exception as e:
+                    running_msg = f"\n  ❌ Failed to start: {str(e)[:30]}"
+            
+            success_text = upload_text + f"""║  ✅ Upload Complete!{running_msg}
+║  🤖 Slots Used: {current_bots + 1}/{max_bots if max_bots != float('inf') else '∞'}
 ╚══════════════════════════════════════╝
 """
-        
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        if file_ext in ['py', 'js']:
-            markup.add(
-                types.InlineKeyboardButton("▶️ Run Now", callback_data=f"run_{file_name}"),
-                types.InlineKeyboardButton("📂 View Files", callback_data="back_to_files")
-            )
-        else:
-            markup.add(types.InlineKeyboardButton("📂 View Files", callback_data="back_to_files"))
-        
-        try:
-            bot.edit_message_text(success_text, message.chat.id, progress_msg.message_id,
-                                  parse_mode='HTML', reply_markup=markup)
-        except:
-            bot.send_message(message.chat.id, success_text, parse_mode='HTML', reply_markup=markup)
+            
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            if file_ext in ['py', 'js']:
+                markup.add(
+                    types.InlineKeyboardButton("▶️ Run Now", callback_data=f"run_{file_name}"),
+                    types.InlineKeyboardButton("📂 View Files", callback_data="back_to_files")
+                )
+            else:
+                markup.add(types.InlineKeyboardButton("📂 View Files", callback_data="back_to_files"))
+            
+            try:
+                bot.edit_message_text(success_text, message.chat.id, progress_msg.message_id,
+                                      parse_mode='HTML', reply_markup=markup)
+            except:
+                bot.send_message(message.chat.id, success_text, parse_mode='HTML', reply_markup=markup)
+                
     except Exception as e:
         logger.error(f"{BRAND_NAME} Upload error: {e}")
         try:
@@ -1951,7 +2117,7 @@ def handle_document(message):
             bot.reply_to(message, f"❌ Upload failed: {str(e)[:100]}")
 
 # ============================================
-# CALLBACK QUERY HANDLER
+# CALLBACK QUERY HANDLER (UPDATED)
 # ============================================
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -1969,6 +2135,25 @@ def handle_callback(call):
             refresh_points(call)
         elif data == "copy_referral_link":
             copy_referral_link(call)
+        
+        # --- NEW: View Running ---
+        elif data == "view_running":
+            class FakeMessage:
+                def __init__(self, call):
+                    self.chat = call.message.chat
+                    self.from_user = call.from_user
+            running_command(FakeMessage(call))
+            bot.answer_callback_query(call.id)
+        
+        # --- NEW: Retry Failed ---
+        elif data.startswith("retry_failed_"):
+            target_user = int(data[13:])
+            retry_failed_scripts(call, target_user)
+        
+        # --- NEW: Stop All ---
+        elif data.startswith("stop_all_"):
+            target_user = int(data[9:])
+            stop_all_user_scripts(call, target_user)
         
         # --- File callbacks ---
         elif data.startswith("file_"):
@@ -2428,6 +2613,83 @@ def show_user_files_callback(call):
             self.from_user = call.from_user
     show_user_files(FakeMessage(call))
     bot.answer_callback_query(call.id)
+
+# ============================================
+# RETRY FAILED & STOP ALL FUNCTIONS
+# ============================================
+
+def retry_failed_scripts(call, target_user):
+    """Retry failed scripts"""
+    user_id = call.from_user.id
+    if user_id != target_user and user_id != OWNER_ID and user_id not in admin_ids:
+        bot.answer_callback_query(call.id, "❌ You can only retry your own scripts!")
+        return
+    
+    bot.answer_callback_query(call.id, "🔄 Retrying failed scripts...")
+    
+    user_folder = get_user_folder(target_user)
+    files = user_files.get(target_user, [])
+    
+    started = 0
+    failed = 0
+    
+    for file_name, file_type in files:
+        if file_type in ['py', 'js']:
+            if is_bot_running(target_user, file_name):
+                continue
+            
+            script_path = os.path.join(user_folder, file_name)
+            if os.path.exists(script_path):
+                try:
+                    if file_type == 'py':
+                        threading.Thread(
+                            target=run_script,
+                            args=(script_path, target_user, user_folder, file_name, call.message)
+                        ).start()
+                    else:
+                        threading.Thread(
+                            target=run_js_script,
+                            args=(script_path, target_user, user_folder, file_name, call.message)
+                        ).start()
+                    started += 1
+                    time.sleep(0.3)
+                except:
+                    failed += 1
+    
+    bot.send_message(call.message.chat.id, f"""
+✅ <b>Retry Complete!</b>
+🚀 <b>Started:</b> {started}
+❌ <b>Failed:</b> {failed}
+""", parse_mode='HTML')
+
+def stop_all_user_scripts(call, target_user):
+    """Stop all scripts of a user"""
+    user_id = call.from_user.id
+    if user_id != target_user and user_id != OWNER_ID and user_id not in admin_ids:
+        bot.answer_callback_query(call.id, "❌ You can only stop your own scripts!")
+        return
+    
+    bot.answer_callback_query(call.id, "🛑 Stopping all scripts...")
+    
+    stopped = 0
+    for script_key, info in list(bot_scripts.items()):
+        if info.get('user_id') == target_user:
+            try:
+                kill_process_tree(info)
+                cleanup_script(script_key)
+                stopped += 1
+            except:
+                pass
+    
+    bot.send_message(call.message.chat.id, f"""
+✅ <b>Stopped {stopped} scripts!</b>
+""", parse_mode='HTML')
+    
+    class FakeMessage:
+        def __init__(self, call):
+            self.chat = call.message.chat
+            self.from_user = call.from_user
+    show_user_files(FakeMessage(call))
 
 # ============================================
 # ADMIN CALLBACK FUNCTIONS
