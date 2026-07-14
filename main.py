@@ -60,7 +60,7 @@ def get_db_connection():
 TOKEN = os.environ.get('BOT_TOKEN', '')
 OWNER_ID = int(os.environ.get('OWNER_ID', 8105949422))
 ADMIN_ID = int(os.environ.get('ADMIN_ID', 8105949422))
-YOUR_USERNAME = os.environ.get('USERNAME', '@SENZO_DEV')
+YOUR_USERNAME = os.environ.get('USERNAME', '@Senzo268')
 UPDATE_CHANNEL = os.environ.get('CHANNEL', 'https://telegram.me/Senzo_Official')
 
 # Brand Name
