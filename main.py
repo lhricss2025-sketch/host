@@ -57,11 +57,11 @@ def get_db_connection():
 # CONFIGURATION
 # ============================================
 
-TOKEN = '7626175588:AAExy_qI9eplPj9qa3w0BIBRy1Y6HIzf2fc'  # Apna token
-OWNER_ID = 7847937078  # Apna ID
-ADMIN_ID = 7847937078  # Apna ID
-YOUR_USERNAME = '@SENZO_DEV'  # Apna username
-UPDATE_CHANNEL = 'https://t.me/senzo_devs'  # Apna channel
+TOKEN = os.environ.get('BOT_TOKEN', '')
+OWNER_ID = int(os.environ.get('OWNER_ID', 8105949422))
+ADMIN_ID = int(os.environ.get('ADMIN_ID', 8105949422))
+YOUR_USERNAME = os.environ.get('USERNAME', '@SENZO_DEV')
+UPDATE_CHANNEL = os.environ.get('CHANNEL', 'https://telegram.me/Senzo_Official')
 
 # Brand Name
 BRAND_NAME = "SENZO DEV"
