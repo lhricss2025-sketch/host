@@ -2,3 +2,4 @@ pyTelegramBotAPI==4.13.0
 psutil==5.9.6
 Flask==3.0.0
 requests==2.31.0
+libsql-experimental==0.0.12
