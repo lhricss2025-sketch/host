@@ -72,7 +72,7 @@ BRAND_EMOJI = "🐺"
 # ============================================
 
 # Default banner (change using /setbanner command)
-START_IMAGE_URL = "https://i.postimg.cc/your-image.jpg"
+START_IMAGE_URL = "https://i.postimg.cc/Jn3JGHwS/cvn-on-Tik-Tok.jpg"
 
 # Default description (change using /setdesc command)
 START_DESCRIPTION = """
