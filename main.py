@@ -3,7 +3,6 @@ import telebot
 import subprocess
 import os
 import zipfile
-import tempfile
 import shutil
 from telebot import types
 import time
@@ -228,7 +227,8 @@ def load_data():
                 'entry_file': entry_file,
                 'entry_type': entry_type,
                 'file_count': file_count,
-                'upload_time': upload_time
+                'upload_time': upload_time,
+                'user_id': uid
             })
 
         c.execute('SELECT user_id FROM active_users')
@@ -766,33 +766,63 @@ TELEGRAM_MODULES = {
 }
 
 def auto_install_bulk_dependencies(folder, message_obj=None):
-    """Runs once right after extraction: requirements.txt for python, package.json for node."""
+    """Runs once right after extraction: requirements.txt for python, package.json for node.
+    Always reports back to chat when done — success, failure, or timeout — so it never looks stuck."""
     req_path = os.path.join(folder, 'requirements.txt')
     if os.path.exists(req_path):
+        if message_obj:
+            bot.send_message(message_obj.chat.id, "📦 <b>requirements.txt</b> found — installing packages, this can take a minute...", parse_mode='HTML')
         try:
-            if message_obj:
-                bot.send_message(message_obj.chat.id, "📦 <b>requirements.txt</b> found — installing packages...", parse_mode='HTML')
-            subprocess.run(
+            result = subprocess.run(
                 [sys.executable, '-m', 'pip', 'install', '-r', req_path, '--disable-pip-version-check', '--no-input'],
-                capture_output=True, text=True, timeout=300, encoding='utf-8', errors='ignore'
+                capture_output=True, text=True, timeout=240, encoding='utf-8', errors='ignore'
             )
+            if message_obj:
+                if result.returncode == 0:
+                    bot.send_message(message_obj.chat.id, "✅ <b>requirements.txt</b> installed successfully.", parse_mode='HTML')
+                else:
+                    tail = (result.stderr or result.stdout or "")[-500:]
+                    bot.send_message(message_obj.chat.id,
+                                     f"⚠️ <b>Some packages in requirements.txt failed to install</b> — will still try to run, "
+                                     f"and auto-install anything still missing on crash.\n<code>{tail}</code>",
+                                     parse_mode='HTML')
+        except subprocess.TimeoutExpired:
+            logger.error(f"{BRAND_NAME} requirements.txt install timed out for {folder}")
+            if message_obj:
+                bot.send_message(message_obj.chat.id, "⏱️ <b>requirements.txt install timed out</b> after 4 minutes — trying to run the bot anyway.", parse_mode='HTML')
         except Exception as e:
             logger.error(f"{BRAND_NAME} requirements.txt install error: {e}")
+            if message_obj:
+                bot.send_message(message_obj.chat.id, f"⚠️ requirements.txt install error: {str(e)[:200]}", parse_mode='HTML')
 
     pkg_path = os.path.join(folder, 'package.json')
     if os.path.exists(pkg_path):
+        if message_obj:
+            bot.send_message(message_obj.chat.id, "📦 <b>package.json</b> found — running npm install, this can take a minute...", parse_mode='HTML')
         try:
-            if message_obj:
-                bot.send_message(message_obj.chat.id, "📦 <b>package.json</b> found — running npm install...", parse_mode='HTML')
-            subprocess.run(
+            result = subprocess.run(
                 ['npm', 'install', '--no-audit', '--no-fund'],
-                cwd=folder, capture_output=True, text=True, timeout=300, encoding='utf-8', errors='ignore'
+                cwd=folder, capture_output=True, text=True, timeout=240, encoding='utf-8', errors='ignore'
             )
+            if message_obj:
+                if result.returncode == 0:
+                    bot.send_message(message_obj.chat.id, "✅ <b>npm install</b> completed successfully.", parse_mode='HTML')
+                else:
+                    tail = (result.stderr or result.stdout or "")[-500:]
+                    bot.send_message(message_obj.chat.id,
+                                     f"⚠️ <b>npm install had errors</b> — will still try to run.\n<code>{tail}</code>",
+                                     parse_mode='HTML')
+        except subprocess.TimeoutExpired:
+            logger.error(f"{BRAND_NAME} npm install timed out for {folder}")
+            if message_obj:
+                bot.send_message(message_obj.chat.id, "⏱️ <b>npm install timed out</b> after 4 minutes — trying to run the bot anyway.", parse_mode='HTML')
         except FileNotFoundError:
             if message_obj:
                 bot.send_message(message_obj.chat.id, "⚠️ npm not found on this host — skipping package.json install.")
         except Exception as e:
             logger.error(f"{BRAND_NAME} npm install error: {e}")
+            if message_obj:
+                bot.send_message(message_obj.chat.id, f"⚠️ npm install error: {str(e)[:200]}", parse_mode='HTML')
 
 def attempt_install_pip(module_name, message):
     package_name = TELEGRAM_MODULES.get(module_name.lower(), module_name)
@@ -993,6 +1023,23 @@ def run_bot_instance(bot_entry, message_obj, attempt=1, admin_id=None):
     except Exception:
         bot.send_message(message_obj.chat.id, error_msg, parse_mode='HTML')
     cleanup_script(bot_id)
+
+def run_bot_instance_safe(bot_entry, message_obj, attempt=1, admin_id=None):
+    """Thin safety wrapper — any uncaught exception here gets reported to chat instead of
+    silently killing the background thread (which is what made things look 'stuck')."""
+    try:
+        run_bot_instance(bot_entry, message_obj, attempt, admin_id)
+    except Exception as e:
+        logger.error(f"{BRAND_NAME} run_bot_instance crashed for {bot_entry.get('bot_name')}: {e}")
+        try:
+            bot.send_message(
+                message_obj.chat.id,
+                f"❌ <b>Unexpected error while starting</b> <code>{bot_entry.get('bot_name', 'bot')}</code>:\n"
+                f"<code>{str(e)[:300]}</code>",
+                parse_mode='HTML'
+            )
+        except Exception:
+            pass
 
 # ============================================
 # KEYBOARD LAYOUTS
@@ -1946,7 +1993,8 @@ def handle_document(message):
             'entry_file': entry_file,
             'entry_type': entry_type,
             'file_count': file_count,
-            'upload_time': datetime.now().isoformat()
+            'upload_time': datetime.now().isoformat(),
+            'user_id': user_id
         })
         save_hosted_bot_db(bot_id, user_id, bot_name, folder_name, entry_file, entry_type, file_count)
 
@@ -1981,16 +2029,28 @@ def handle_document(message):
     threading.Thread(target=_deploy_and_run, args=(bot_entry, message)).start()
 
 def _deploy_and_run(bot_entry, message):
-    auto_install_bulk_dependencies(bot_entry['folder'], message)
-    if bot_entry['entry_file']:
-        run_bot_instance(bot_entry, message)
-    else:
-        bot.send_message(
-            message.chat.id,
-            f"📦 <b>{bot_entry['bot_name']}</b> stored — no runnable .py/.js entry point was found in it, "
-            f"so nothing was started. Use 📂 Check Files to inspect or download it.",
-            parse_mode='HTML'
-        )
+    try:
+        auto_install_bulk_dependencies(bot_entry['folder'], message)
+        if bot_entry['entry_file']:
+            run_bot_instance_safe(bot_entry, message)
+        else:
+            bot.send_message(
+                message.chat.id,
+                f"📦 <b>{bot_entry['bot_name']}</b> stored — no runnable .py/.js entry point was found in it, "
+                f"so nothing was started. Use 📂 Check Files to inspect or download it.",
+                parse_mode='HTML'
+            )
+    except Exception as e:
+        logger.error(f"{BRAND_NAME} Deploy thread crashed for {bot_entry.get('bot_name')}: {e}")
+        try:
+            bot.send_message(
+                message.chat.id,
+                f"❌ <b>Deployment hit an unexpected error</b> for <code>{bot_entry.get('bot_name', 'bot')}</code>:\n"
+                f"<code>{str(e)[:300]}</code>\n\nThe files are still saved — check 📂 Check Files to retry running it.",
+                parse_mode='HTML'
+            )
+        except Exception:
+            pass
 
 # ============================================
 # CALLBACK QUERY HANDLER
@@ -2164,7 +2224,7 @@ def run_user_bot(call, bot_id):
         bot.answer_callback_query(call.id, "⚠️ Already running!")
         return
     bot.answer_callback_query(call.id, "🚀 Starting...")
-    threading.Thread(target=run_bot_instance, args=(b, call.message)).start()
+    threading.Thread(target=run_bot_instance_safe, args=(b, call.message)).start()
 
 def stop_user_bot(call, bot_id):
     user_id = call.from_user.id
@@ -2192,7 +2252,6 @@ def stop_user_bot(call, bot_id):
         log_action(user_id, "BOT_STOP", f"Stopped {bot_name}")
 
 def restart_user_bot(call, bot_id):
-    user_id = call.from_user.id
     if bot_id in bot_scripts:
         kill_process_tree(bot_scripts[bot_id])
         cleanup_script(bot_id)
@@ -2408,7 +2467,7 @@ def admin_run_bot(call, bot_id):
         bot.answer_callback_query(call.id, "⚠️ Already running!")
         return
     bot.answer_callback_query(call.id, f"🚀 Running {b['bot_name']}...")
-    threading.Thread(target=run_bot_instance, args=(b, call.message)).start()
+    threading.Thread(target=run_bot_instance_safe, args=(b, call.message)).start()
 
 def admin_stop_bot(call, bot_id):
     if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
