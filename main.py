@@ -12,14 +12,12 @@ import psutil
 import sqlite3
 import json
 import logging
-import signal
 import threading
 import re
 import sys
 import atexit
 import requests
-import random
-import hashlib
+import uuid
 from flask import Flask
 from threading import Thread
 
@@ -27,7 +25,6 @@ from threading import Thread
 # TURSO DATABASE SETUP
 # ============================================
 
-# Try to import Turso
 try:
     import libsql_experimental as libsql
     TURSO_AVAILABLE = True
@@ -35,7 +32,6 @@ except ImportError:
     TURSO_AVAILABLE = False
     print("⚠️ Turso not installed, using local SQLite")
 
-# Get Turso credentials from environment variables (Railway)
 TURSO_URL = os.environ.get('TURSO_URL', '')
 TURSO_TOKEN = os.environ.get('TURSO_TOKEN', '')
 
@@ -44,17 +40,15 @@ def get_db_connection():
     if TURSO_AVAILABLE and TURSO_URL and TURSO_TOKEN:
         try:
             conn = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
-            print("✅ Connected to Turso database!")
             return conn
         except Exception as e:
             print(f"❌ Turso connection failed: {e}")
-            print("⚠️ Falling back to local SQLite...")
             return sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     else:
         return sqlite3.connect(DATABASE_PATH, check_same_thread=False)
 
 # ============================================
-# CONFIGURATION (Environment Variables Se)
+# CONFIGURATION
 # ============================================
 
 TOKEN = os.environ.get('BOT_TOKEN', '')
@@ -63,21 +57,14 @@ ADMIN_ID = int(os.environ.get('ADMIN_ID', 8105949422))
 YOUR_USERNAME = os.environ.get('USERNAME', '@Senzo268')
 UPDATE_CHANNEL = os.environ.get('CHANNEL', 'https://telegram.me/Senzo_Official')
 
-# Brand Name
 BRAND_NAME = "SENZO DEV"
 BRAND_EMOJI = "🐺"
 
-# ============================================
-# 🖼️ START IMAGE CONFIGURATION
-# ============================================
-
-# Default banner (change using /setbanner command)
 START_IMAGE_URL = "https://i.postimg.cc/Jn3JGHwS/cvn-on-Tik-Tok.jpg"
 
-# Default description (change using /setdesc command)
 START_DESCRIPTION = """
 🚀 <b>Upload & Host Your Bots</b>
-📤 <b>Supported:</b> Python • Node.js • ZIP
+📤 <b>Supported:</b> ANY file type • ZIP auto-deploy
 ⭐ <b>Earn Points:</b> 1 Point per Referral
 🎯 <b>5 Points</b> = 1 Extra Bot Slot
 💎 <b>Free:</b> 2 Bots to Start
@@ -92,6 +79,7 @@ UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, 'upload_bots')
 IROTECH_DIR = os.path.join(BASE_DIR, 'inf')
 DATABASE_PATH = os.path.join(IROTECH_DIR, 'bot_data.db')
 LOGS_DIR = os.path.join(BASE_DIR, 'logs')
+TMP_DIR = os.path.join(BASE_DIR, 'tmp_downloads')
 
 FREE_USER_LIMIT = 10
 SUBSCRIBED_USER_LIMIT = 15
@@ -101,11 +89,28 @@ OWNER_LIMIT = float('inf')
 os.makedirs(UPLOAD_BOTS_DIR, exist_ok=True)
 os.makedirs(IROTECH_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
+os.makedirs(TMP_DIR, exist_ok=True)
+
+# Clear any stale temp archives left over from a previous crashed run
+for _f in os.listdir(TMP_DIR):
+    try:
+        os.remove(os.path.join(TMP_DIR, _f))
+    except Exception:
+        pass
+
+if not TOKEN:
+    print("❌ FATAL: BOT_TOKEN environment variable is not set. Set it in Railway → Variables.")
+    sys.exit(1)
 
 bot = telebot.TeleBot(TOKEN, parse_mode='HTML')
+
+# script_key (bot_id) -> {process, log_file, log_path, start_time, entry_file, entry_type, folder, user_id, bot_name}
 bot_scripts = {}
 user_subscriptions = {}
-user_files = {}
+
+# user_id -> [ {bot_id, bot_name, folder, entry_file, entry_type, upload_time, file_count} ]
+user_bots = {}
+
 active_users = set()
 admin_ids = {ADMIN_ID, OWNER_ID}
 bot_locked = False
@@ -146,59 +151,55 @@ def keep_alive():
     print(f"✅ Flask Keep-Alive server started for {BRAND_NAME}.")
 
 # ============================================
-# DATABASE FUNCTIONS (Turso + Fallback)
+# DATABASE FUNCTIONS
 # ============================================
 
 def init_db():
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        
+
         c.execute('''CREATE TABLE IF NOT EXISTS subscriptions
         (user_id INTEGER PRIMARY KEY, expiry TEXT)''')
-        
-        c.execute('''CREATE TABLE IF NOT EXISTS user_files
-        (user_id INTEGER, file_name TEXT, file_type TEXT, upload_time TEXT,
-        file_size INTEGER, PRIMARY KEY (user_id, file_name))''')
-        
+
+        c.execute('''CREATE TABLE IF NOT EXISTS hosted_bots
+        (bot_id TEXT PRIMARY KEY, user_id INTEGER, bot_name TEXT, folder_name TEXT,
+        entry_file TEXT, entry_type TEXT, file_count INTEGER, upload_time TEXT)''')
+
         c.execute('''CREATE TABLE IF NOT EXISTS active_users
         (user_id INTEGER PRIMARY KEY, username TEXT, first_seen TEXT, last_seen TEXT)''')
-        
+
         c.execute('''CREATE TABLE IF NOT EXISTS admins
         (user_id INTEGER PRIMARY KEY)''')
-        
+
         c.execute('''CREATE TABLE IF NOT EXISTS bot_logs
         (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, action TEXT,
         details TEXT, timestamp TEXT)''')
-        
-        c.execute('''CREATE TABLE IF NOT EXISTS running_scripts
-        (script_key TEXT PRIMARY KEY, user_id INTEGER, file_name TEXT,
-        start_time TEXT, pid INTEGER)''')
-        
+
         c.execute('''CREATE TABLE IF NOT EXISTS user_points
         (user_id INTEGER PRIMARY KEY,
          points INTEGER DEFAULT 0,
          total_referrals INTEGER DEFAULT 0,
          last_updated TEXT)''')
-        
+
         c.execute('''CREATE TABLE IF NOT EXISTS referrals
         (id INTEGER PRIMARY KEY AUTOINCREMENT,
          referrer_id INTEGER,
          referred_user_id INTEGER UNIQUE,
          referred_at TEXT,
          points_awarded INTEGER DEFAULT 1)''')
-        
+
         c.execute('''CREATE TABLE IF NOT EXISTS points_history
         (id INTEGER PRIMARY KEY AUTOINCREMENT,
          user_id INTEGER,
          points_change INTEGER,
          reason TEXT,
          timestamp TEXT)''')
-        
+
         c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
         if ADMIN_ID != OWNER_ID:
             c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (ADMIN_ID,))
-        
+
         conn.commit()
         conn.close()
         logger.info(f"{BRAND_NAME} Database initialized successfully.")
@@ -209,26 +210,33 @@ def load_data():
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        
+
         c.execute('SELECT user_id, expiry FROM subscriptions')
         for user_id, expiry in c.fetchall():
             try:
                 user_subscriptions[user_id] = {'expiry': datetime.fromisoformat(expiry)}
             except ValueError:
                 pass
-        
-        c.execute('SELECT user_id, file_name, file_type FROM user_files')
-        for user_id, file_name, file_type in c.fetchall():
-            if user_id not in user_files:
-                user_files[user_id] = []
-            user_files[user_id].append((file_name, file_type))
-        
+
+        c.execute('SELECT bot_id, user_id, bot_name, folder_name, entry_file, entry_type, file_count, upload_time FROM hosted_bots')
+        for bot_id, uid, bot_name, folder_name, entry_file, entry_type, file_count, upload_time in c.fetchall():
+            user_bots.setdefault(uid, []).append({
+                'bot_id': bot_id,
+                'bot_name': bot_name,
+                'folder': os.path.join(get_user_folder(uid), folder_name),
+                'folder_name': folder_name,
+                'entry_file': entry_file,
+                'entry_type': entry_type,
+                'file_count': file_count,
+                'upload_time': upload_time
+            })
+
         c.execute('SELECT user_id FROM active_users')
         active_users.update(user_id for (user_id,) in c.fetchall())
-        
+
         c.execute('SELECT user_id FROM admins')
         admin_ids.update(user_id for (user_id,) in c.fetchall())
-        
+
         conn.close()
         logger.info(f"{BRAND_NAME} Data loaded successfully.")
     except Exception as e:
@@ -245,30 +253,29 @@ def log_action(user_id, action, details):
     except Exception as e:
         logger.error(f"{BRAND_NAME} Error logging action: {e}")
 
-def save_user_file_db(user_id, file_name, file_type, file_size=0):
+def save_hosted_bot_db(bot_id, user_id, bot_name, folder_name, entry_file, entry_type, file_count):
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute('''INSERT OR REPLACE INTO user_files
-        (user_id, file_name, file_type, upload_time, file_size)
-        VALUES (?, ?, ?, ?, ?)''',
-        (user_id, file_name, file_type, datetime.now().isoformat(), file_size))
+        c.execute('''INSERT OR REPLACE INTO hosted_bots
+        (bot_id, user_id, bot_name, folder_name, entry_file, entry_type, file_count, upload_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+        (bot_id, user_id, bot_name, folder_name, entry_file, entry_type, file_count, datetime.now().isoformat()))
         conn.commit()
         conn.close()
-        log_action(user_id, "FILE_UPLOAD", f"Uploaded {file_name}")
+        log_action(user_id, "BOT_UPLOAD", f"Uploaded {bot_name}")
     except Exception as e:
-        logger.error(f"{BRAND_NAME} Error saving file: {e}")
+        logger.error(f"{BRAND_NAME} Error saving hosted bot: {e}")
 
-def remove_user_file_db(user_id, file_name):
+def remove_hosted_bot_db(bot_id):
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute('DELETE FROM user_files WHERE user_id = ? AND file_name = ?', (user_id, file_name))
+        c.execute('DELETE FROM hosted_bots WHERE bot_id = ?', (bot_id,))
         conn.commit()
         conn.close()
-        log_action(user_id, "FILE_DELETE", f"Deleted {file_name}")
     except Exception as e:
-        logger.error(f"{BRAND_NAME} Error removing file: {e}")
+        logger.error(f"{BRAND_NAME} Error removing hosted bot: {e}")
 
 def save_active_user(user_id, username=None):
     try:
@@ -328,18 +335,18 @@ def get_user_points(user_id):
         if result:
             return {'points': result[0], 'total_referrals': result[1]}
         return {'points': 0, 'total_referrals': 0}
-    except Exception as e:
+    except Exception:
         return {'points': 0, 'total_referrals': 0}
 
 def add_points(user_id, points, reason="Referral"):
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute('''UPDATE user_points 
-                     SET points = points + ?, 
+        c.execute('''UPDATE user_points
+                     SET points = points + ?,
                          total_referrals = total_referrals + 1,
                          last_updated = ?
-                     WHERE user_id = ?''', 
+                     WHERE user_id = ?''',
                   (points, datetime.now().isoformat(), user_id))
         c.execute('''INSERT INTO points_history (user_id, points_change, reason, timestamp)
                      VALUES (?, ?, ?, ?)''',
@@ -358,15 +365,12 @@ def get_user_max_bots(user_id):
     extra_bots = points // 5
     if user_id == OWNER_ID or user_id in admin_ids:
         return float('inf')
-    
-    # Check subscription
     if user_id in user_subscriptions and user_subscriptions[user_id]['expiry'] > datetime.now():
         return SUBSCRIBED_USER_LIMIT
-    
     return min(base_limit + extra_bots, FREE_USER_LIMIT)
 
 def get_current_bot_count(user_id):
-    return len(user_files.get(user_id, []))
+    return len(user_bots.get(user_id, []))
 
 def can_user_upload(user_id):
     max_bots = get_user_max_bots(user_id)
@@ -383,32 +387,32 @@ def process_referral_link(referred_user_id, referrer_id):
     try:
         if referrer_id == referred_user_id:
             return False, "❌ You can't refer yourself!"
-        
+
         conn = get_db_connection()
         c = conn.cursor()
-        
+
         c.execute('SELECT id FROM referrals WHERE referred_user_id = ?', (referred_user_id,))
         if c.fetchone():
             conn.close()
             return False, "❌ You have already been referred!"
-        
-        c.execute('SELECT id FROM referrals WHERE referrer_id = ? AND referred_user_id = ?', 
+
+        c.execute('SELECT id FROM referrals WHERE referrer_id = ? AND referred_user_id = ?',
                   (referrer_id, referred_user_id))
         if c.fetchone():
             conn.close()
             return False, "❌ This user has already referred you!"
-        
+
         initialize_user_points(referrer_id)
         initialize_user_points(referred_user_id)
         add_points(referrer_id, 1, f"Referral from user {referred_user_id}")
-        
+
         c.execute('''INSERT INTO referrals (referrer_id, referred_user_id, referred_at, points_awarded)
                      VALUES (?, ?, ?, ?)''',
                   (referrer_id, referred_user_id, datetime.now().isoformat(), 1))
-        
+
         conn.commit()
         conn.close()
-        
+
         try:
             referrer_points = get_user_points(referrer_id)
             bot.send_message(referrer_id, f"""
@@ -422,11 +426,11 @@ Someone used your referral link!
 
 Keep sharing your referral link! 🚀
 """, parse_mode='HTML')
-        except:
+        except Exception:
             pass
-        
+
         return True, "✅ Referral successful! You got 1 point! 🎉"
-        
+
     except Exception as e:
         logger.error(f"{BRAND_NAME} Error processing referral: {e}")
         return False, f"❌ Error: {str(e)[:50]}"
@@ -438,10 +442,10 @@ def get_referral_stats(user_id):
         c.execute('SELECT COUNT(*) FROM referrals WHERE referrer_id = ?', (user_id,))
         total_refs = c.fetchone()[0]
         points_data = get_user_points(user_id)
-        c.execute('''SELECT referred_user_id, referred_at 
-                     FROM referrals 
-                     WHERE referrer_id = ? 
-                     ORDER BY referred_at DESC 
+        c.execute('''SELECT referred_user_id, referred_at
+                     FROM referrals
+                     WHERE referrer_id = ?
+                     ORDER BY referred_at DESC
                      LIMIT 10''', (user_id,))
         recent_refs = c.fetchall()
         conn.close()
@@ -450,7 +454,7 @@ def get_referral_stats(user_id):
             'points': points_data['points'],
             'recent': recent_refs
         }
-    except Exception as e:
+    except Exception:
         return {'total': 0, 'points': 0, 'recent': []}
 
 # ============================================
@@ -491,8 +495,8 @@ def create_mini_bar(percentage, length=20):
 
 def create_system_stats_message():
     stats = get_system_stats()
-    running_bots = len([k for k, v in bot_scripts.items() if v.get('process') and is_bot_running_check(k)])
-    
+    running_bots = len([k for k in bot_scripts if is_bot_running_check(k)])
+
     try:
         conn = get_db_connection()
         c = conn.cursor()
@@ -501,10 +505,10 @@ def create_system_stats_message():
         c.execute('SELECT COUNT(*) FROM referrals')
         total_refs = c.fetchone()[0]
         conn.close()
-    except:
+    except Exception:
         total_points = 0
         total_refs = 0
-    
+
     msg = f"""
 ╔══════════════════════════════════════╗
 ║       📊 <b>{BRAND_NAME} STATS</b> 📊         ║
@@ -545,22 +549,15 @@ def get_user_file_limit(user_id):
         return SUBSCRIBED_USER_LIMIT
     return FREE_USER_LIMIT
 
-def get_user_file_count(user_id):
-    return len(user_files.get(user_id, []))
-
 def is_bot_running_check(script_key):
     script_info = bot_scripts.get(script_key)
     if script_info and script_info.get('process'):
         try:
             proc = psutil.Process(script_info['process'].pid)
             return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
-        except:
+        except Exception:
             return False
     return False
-
-def is_bot_running(script_owner_id, file_name):
-    script_key = f"{script_owner_id}_{file_name}"
-    return is_bot_running_check(script_key)
 
 def cleanup_script(script_key):
     if script_key in bot_scripts:
@@ -569,7 +566,7 @@ def cleanup_script(script_key):
             try:
                 if not script_info['log_file'].closed:
                     script_info['log_file'].close()
-            except:
+            except Exception:
                 pass
         del bot_scripts[script_key]
 
@@ -579,7 +576,7 @@ def kill_process_tree(process_info):
             try:
                 if not process_info['log_file'].closed:
                     process_info['log_file'].close()
-            except:
+            except Exception:
                 pass
         process = process_info.get('process')
         if process and hasattr(process, 'pid'):
@@ -589,23 +586,37 @@ def kill_process_tree(process_info):
                 for child in children:
                     try:
                         child.terminate()
-                    except:
+                    except Exception:
                         pass
                 gone, alive = psutil.wait_procs(children, timeout=2)
                 for p in alive:
                     try:
                         p.kill()
-                    except:
+                    except Exception:
                         pass
                 try:
                     parent.terminate()
                     parent.wait(timeout=2)
-                except:
+                except Exception:
                     parent.kill()
-            except:
+            except Exception:
                 pass
-    except:
+    except Exception:
         pass
+
+def find_bot_by_id(user_id, bot_id):
+    for b in user_bots.get(user_id, []):
+        if b['bot_id'] == bot_id:
+            return b
+    return None
+
+def find_bot_anywhere(bot_id):
+    """Admins need to reach a bot without knowing which user owns it."""
+    for uid, blist in user_bots.items():
+        for b in blist:
+            if b['bot_id'] == bot_id:
+                return uid, b
+    return None, None
 
 # ============================================
 # ANIMATION FUNCTIONS
@@ -616,11 +627,12 @@ def send_animated_message(chat_id, final_text, animation_type="loading", duratio
         action_map = {
             "loading": "Authenticating session",
             "upload": "Uploading file",
+            "extract": "Extracting archive",
+            "install": "Installing dependencies",
             "download": "Downloading file",
             "delete": "Deleting file",
             "run": "Starting script",
             "stop": "Stopping script",
-            "install": "Installing dependencies",
             "terminal": "Initializing terminal"
         }
         action_text = action_map.get(animation_type, "Processing")
@@ -634,12 +646,12 @@ def send_animated_message(chat_id, final_text, animation_type="loading", duratio
             else:
                 try:
                     bot.edit_message_text(display, chat_id, msg.message_id)
-                except:
+                except Exception:
                     pass
             time.sleep(duration / steps)
         try:
             bot.edit_message_text(final_text, chat_id, msg.message_id, parse_mode='HTML')
-        except:
+        except Exception:
             bot.send_message(chat_id, final_text, parse_mode='HTML')
         return msg
     except Exception as e:
@@ -650,7 +662,86 @@ def send_spinner_animation(chat_id, text, duration=2):
     return send_animated_message(chat_id, text, "loading", duration)
 
 # ============================================
-# PACKAGE INSTALLATION
+# ENTRY-POINT DETECTION (any zip / any folder)
+# ============================================
+
+PY_ENTRY_CANDIDATES = ['main.py', 'bot.py', 'app.py', 'run.py', 'start.py', 'server.py']
+JS_ENTRY_CANDIDATES = ['index.js', 'bot.js', 'app.js', 'main.js', 'server.js']
+IGNORED_DIRS = {'__pycache__', 'node_modules', '.git', '.idea', '.vscode', 'venv', '.venv'}
+
+def flatten_single_wrapper_folder(folder):
+    """If the extracted zip is just one wrapper directory, move its contents up."""
+    entries = [e for e in os.listdir(folder) if not e.startswith('__MACOSX')]
+    if len(entries) == 1:
+        only_path = os.path.join(folder, entries[0])
+        if os.path.isdir(only_path):
+            for item in os.listdir(only_path):
+                shutil.move(os.path.join(only_path, item), os.path.join(folder, item))
+            shutil.rmtree(only_path, ignore_errors=True)
+
+def find_entry_point(folder):
+    """Walks the bot folder and figures out what to run. Returns (relative_path, type) or (None, None)."""
+    all_py, all_js = [], []
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and not d.startswith('__MACOSX')]
+        for f in files:
+            rel = os.path.relpath(os.path.join(root, f), folder)
+            if f.endswith('.py'):
+                all_py.append(rel)
+            elif f.endswith('.js'):
+                all_js.append(rel)
+
+    # package.json "main" field takes priority for JS bots
+    pkg_json = os.path.join(folder, 'package.json')
+    if os.path.exists(pkg_json):
+        try:
+            with open(pkg_json, 'r', encoding='utf-8', errors='ignore') as fh:
+                data = json.load(fh)
+            main_field = data.get('main')
+            if main_field:
+                candidate = os.path.normpath(main_field)
+                if os.path.exists(os.path.join(folder, candidate)):
+                    return candidate, 'js'
+        except Exception:
+            pass
+
+    for cand in PY_ENTRY_CANDIDATES:
+        for p in all_py:
+            if os.path.basename(p) == cand:
+                return p, 'py'
+    for cand in JS_ENTRY_CANDIDATES:
+        for p in all_js:
+            if os.path.basename(p) == cand:
+                return p, 'js'
+
+    # Fallback: prefer python (it's the more common bot-hosting case), root-level, shortest path
+    if all_py:
+        all_py.sort(key=lambda p: (p.count(os.sep), len(p)))
+        return all_py[0], 'py'
+    if all_js:
+        all_js.sort(key=lambda p: (p.count(os.sep), len(p)))
+        return all_js[0], 'js'
+
+    return None, None
+
+def check_node_available():
+    try:
+        result = subprocess.run(['node', '--version'], capture_output=True, text=True, timeout=10)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+NODE_AVAILABLE = check_node_available()
+
+def count_files(folder):
+    total = 0
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+        total += len(files)
+    return total
+
+# ============================================
+# AUTO DEPENDENCY INSTALL
 # ============================================
 
 TELEGRAM_MODULES = {
@@ -674,22 +765,51 @@ TELEGRAM_MODULES = {
     'fastapi': 'fastapi',
 }
 
+def auto_install_bulk_dependencies(folder, message_obj=None):
+    """Runs once right after extraction: requirements.txt for python, package.json for node."""
+    req_path = os.path.join(folder, 'requirements.txt')
+    if os.path.exists(req_path):
+        try:
+            if message_obj:
+                bot.send_message(message_obj.chat.id, "📦 <b>requirements.txt</b> found — installing packages...", parse_mode='HTML')
+            subprocess.run(
+                [sys.executable, '-m', 'pip', 'install', '-r', req_path, '--disable-pip-version-check', '--no-input'],
+                capture_output=True, text=True, timeout=300, encoding='utf-8', errors='ignore'
+            )
+        except Exception as e:
+            logger.error(f"{BRAND_NAME} requirements.txt install error: {e}")
+
+    pkg_path = os.path.join(folder, 'package.json')
+    if os.path.exists(pkg_path):
+        try:
+            if message_obj:
+                bot.send_message(message_obj.chat.id, "📦 <b>package.json</b> found — running npm install...", parse_mode='HTML')
+            subprocess.run(
+                ['npm', 'install', '--no-audit', '--no-fund'],
+                cwd=folder, capture_output=True, text=True, timeout=300, encoding='utf-8', errors='ignore'
+            )
+        except FileNotFoundError:
+            if message_obj:
+                bot.send_message(message_obj.chat.id, "⚠️ npm not found on this host — skipping package.json install.")
+        except Exception as e:
+            logger.error(f"{BRAND_NAME} npm install error: {e}")
+
 def attempt_install_pip(module_name, message):
     package_name = TELEGRAM_MODULES.get(module_name.lower(), module_name)
-    if package_name is None:
+    if not package_name:
         return False
     try:
         msg = send_spinner_animation(message.chat.id, f"Installing {package_name}...", duration=2)
-        command = [sys.executable, '-m', 'pip', 'install', package_name]
+        command = [sys.executable, '-m', 'pip', 'install', package_name, '--disable-pip-version-check', '--no-input']
         result = subprocess.run(command, capture_output=True, text=True, check=False,
-                                encoding='utf-8', errors='ignore', timeout=120)
+                                encoding='utf-8', errors='ignore', timeout=150)
         if result.returncode == 0:
             try:
                 bot.edit_message_text(
                     f"✅ <b>Package Installed!</b>\n📦 <code>{package_name}</code> installed successfully!",
                     message.chat.id, msg.message_id, parse_mode='HTML'
                 )
-            except:
+            except Exception:
                 bot.send_message(message.chat.id, f"✅ Package {package_name} installed!", parse_mode='HTML')
             return True
         else:
@@ -699,225 +819,180 @@ def attempt_install_pip(module_name, message):
                     f"❌ <b>Installation Failed</b>\n<code>{error_msg}</code>",
                     message.chat.id, msg.message_id, parse_mode='HTML'
                 )
-            except:
+            except Exception:
                 pass
             return False
-    except:
+    except Exception:
         return False
 
-def attempt_install_npm(module_name, user_folder, message):
+def attempt_install_npm(module_name, folder, message):
     try:
         msg = send_spinner_animation(message.chat.id, f"Installing npm: {module_name}...", duration=2)
-        command = ['npm', 'install', module_name]
+        command = ['npm', 'install', module_name, '--no-audit', '--no-fund']
         result = subprocess.run(command, capture_output=True, text=True, check=False,
-                                cwd=user_folder, encoding='utf-8', errors='ignore', timeout=120)
+                                cwd=folder, encoding='utf-8', errors='ignore', timeout=150)
         if result.returncode == 0:
             try:
                 bot.edit_message_text(
                     f"✅ <b>NPM Package Installed!</b>\n📦 <code>{module_name}</code>",
                     message.chat.id, msg.message_id, parse_mode='HTML'
                 )
-            except:
+            except Exception:
                 pass
             return True
         return False
     except FileNotFoundError:
-        bot.send_message(message.chat.id, "❌ NPM not found!")
+        bot.send_message(message.chat.id, "❌ NPM not found on this host!")
         return False
-    except:
+    except Exception:
         return False
 
 # ============================================
-# SCRIPT RUNNING FUNCTIONS
+# SCRIPT RUNNING (unified for py + js, keyed by bot_id)
 # ============================================
 
-def run_script(script_path, script_owner_id, user_folder, file_name, message_obj, attempt=1):
-    max_attempts = 3
+def run_bot_instance(bot_entry, message_obj, attempt=1, admin_id=None):
+    """
+    bot_entry: dict with bot_id, folder, entry_file, entry_type, bot_name, user_id
+    Auto-retries on missing-module errors, installing whatever's missing.
+    """
+    max_attempts = 4
+    bot_id = bot_entry['bot_id']
+    folder = bot_entry['folder']
+    entry_file = bot_entry['entry_file']
+    entry_type = bot_entry['entry_type']
+    bot_name = bot_entry['bot_name']
+    owner_id = bot_entry['user_id']
+
     if attempt > max_attempts:
-        bot.send_message(message_obj.chat.id, f"❌ Failed to run '{file_name}' after {max_attempts} attempts.")
+        bot.send_message(message_obj.chat.id, f"❌ Failed to run '{bot_name}' after {max_attempts} attempts — check logs for the root cause.")
         return
-    script_key = f"{script_owner_id}_{file_name}"
-    try:
-        if not os.path.exists(script_path):
-            bot.send_message(message_obj.chat.id, f"❌ Script '{file_name}' not found!")
-            return
-        
+
+    if not entry_type or not entry_file:
+        bot.send_message(message_obj.chat.id, f"⚠️ <b>{bot_name}</b> has no runnable .py or .js entry file — stored, but nothing to execute.", parse_mode='HTML')
+        return
+
+    script_path = os.path.join(folder, entry_file)
+    if not os.path.exists(script_path):
+        bot.send_message(message_obj.chat.id, f"❌ Entry file '{entry_file}' not found!")
+        return
+
+    if entry_type == 'py':
         check_result = subprocess.run(
-            [sys.executable, '-c', f'import ast; ast.parse(open("{script_path}").read())'],
-            capture_output=True, text=True, timeout=10
+            [sys.executable, '-m', 'py_compile', script_path],
+            capture_output=True, text=True, timeout=15
         )
         if check_result.returncode != 0:
             bot.send_message(message_obj.chat.id,
-                             f"⚠️ <b>Syntax Error in Script</b>\n<code>{check_result.stderr[:500]}</code>",
+                             f"⚠️ <b>Syntax Error in {bot_name}</b>\n<code>{check_result.stderr[:600]}</code>",
                              parse_mode='HTML')
             return
-        
-        terminal_msg = f"""
-╔══════════════════════════════════════╗
-║      🚀 <b>{BRAND_NAME}: STARTING SCRIPT</b> 🚀 ║
-╠══════════════════════════════════════╣
-║ 📄 File: <code>{file_name[:25]}</code>
-║ 👤 User: {script_owner_id}
-║ 🔄 Attempt: {attempt}/{max_attempts}
-╚══════════════════════════════════════╝
-"""
-        msg = send_animated_message(message_obj.chat.id, terminal_msg, "run", duration=2)
-        log_file_path = os.path.join(LOGS_DIR, f"{script_key}.log")
-        log_file = open(log_file_path, 'w', encoding='utf-8', errors='ignore')
-        process = subprocess.Popen(
-            [sys.executable, script_path],
-            cwd=user_folder,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding='utf-8',
-            errors='ignore'
-        )
-        bot_scripts[script_key] = {
-            'process': process,
-            'file_name': file_name,
-            'user_id': script_owner_id,
-            'start_time': datetime.now(),
-            'log_file': log_file,
-            'log_path': log_file_path,
-            'script_key': script_key,
-            'script_path': script_path
-        }
-        time.sleep(2)
-        if process.poll() is None:
-            success_msg = f"""
-╔══════════════════════════════════════╗
-║     ✅ <b>{BRAND_NAME}: SCRIPT RUNNING</b> ✅   ║
-╠══════════════════════════════════════╣
-║ 📄 <b>File:</b> <code>{file_name[:25]}</code>
-║ 🆔 <b>PID:</b> {process.pid}
-║ ⏱️ <b>Started:</b> {datetime.now().strftime('%H:%M:%S')}
-╚══════════════════════════════════════╝
-"""
-            try:
-                bot.edit_message_text(success_msg, message_obj.chat.id, msg.message_id, parse_mode='HTML')
-            except:
-                bot.send_message(message_obj.chat.id, success_msg, parse_mode='HTML')
-            log_action(script_owner_id, "SCRIPT_START", f"Started {file_name} (PID: {process.pid})")
-        else:
-            log_file.close()
-            with open(log_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                error_output = f.read()[-1000:]
-            match = re.search(r"ModuleNotFoundError: No module named '(.+?)'", error_output)
-            if match:
-                module_name = match.group(1).strip()
-                if attempt_install_pip(module_name, message_obj):
-                    time.sleep(1)
-                    run_script(script_path, script_owner_id, user_folder, file_name, message_obj, attempt + 1)
-                    return
-            error_msg = f"""
-╔══════════════════════════════════════╗
-║     ❌ <b>{BRAND_NAME}: SCRIPT FAILED</b> ❌     ║
-╠══════════════════════════════════════╣
-║ 📄 <b>File:</b> <code>{file_name[:25]}</code>
-║ ❗ <b>Exit Code:</b> {process.returncode}
-╠══════════════════════════════════════╣
-<code>{error_output[:400]}</code>
-╚══════════════════════════════════════╝
-"""
-            try:
-                bot.edit_message_text(error_msg, message_obj.chat.id, msg.message_id, parse_mode='HTML')
-            except:
-                bot.send_message(message_obj.chat.id, error_msg, parse_mode='HTML')
-            cleanup_script(script_key)
-    except Exception as e:
-        logger.error(f"{BRAND_NAME} Error running script: {e}")
-        bot.send_message(message_obj.chat.id, f"❌ Error: {str(e)[:200]}")
-
-def run_js_script(script_path, script_owner_id, user_folder, file_name, message_obj, attempt=1):
-    max_attempts = 3
-    if attempt > max_attempts:
-        bot.send_message(message_obj.chat.id, f"❌ Failed to run '{file_name}' after {max_attempts} attempts.")
+    elif entry_type == 'js' and not NODE_AVAILABLE:
+        bot.send_message(message_obj.chat.id,
+                         f"❌ <b>{bot_name}</b> needs Node.js, but this host has none installed. "
+                         f"On Railway, add a nixpacks.toml with the nodejs package (included in the deployment files).",
+                         parse_mode='HTML')
         return
-    script_key = f"{script_owner_id}_{file_name}"
-    try:
-        if not os.path.exists(script_path):
-            bot.send_message(message_obj.chat.id, f"❌ Script '{file_name}' not found!")
-            return
-        
-        terminal_msg = f"""
+
+    terminal_msg = f"""
 ╔══════════════════════════════════════╗
-║      🟢 <b>{BRAND_NAME}: STARTING NODE.JS</b> 🟢║
+║      🚀 <b>{BRAND_NAME}: STARTING BOT</b> 🚀  ║
 ╠══════════════════════════════════════╣
-║ 📄 File: <code>{file_name[:25]}</code>
-║ 👤 User: {script_owner_id}
+║ 🤖 Bot: <code>{bot_name[:25]}</code>
+║ 📄 Entry: <code>{entry_file[:25]}</code>
 ║ 🔄 Attempt: {attempt}/{max_attempts}
 ╚══════════════════════════════════════╝
 """
-        msg = send_animated_message(message_obj.chat.id, terminal_msg, "run", duration=2)
-        log_file_path = os.path.join(LOGS_DIR, f"{script_key}.log")
-        log_file = open(log_file_path, 'w', encoding='utf-8', errors='ignore')
+    msg = send_animated_message(message_obj.chat.id, terminal_msg, "run", duration=2)
+    log_file_path = os.path.join(LOGS_DIR, f"{bot_id}.log")
+    log_file = open(log_file_path, 'w', encoding='utf-8', errors='ignore')
+
+    interpreter = [sys.executable, script_path] if entry_type == 'py' else ['node', script_path]
+
+    try:
         process = subprocess.Popen(
-            ['node', script_path],
-            cwd=user_folder,
+            interpreter,
+            cwd=folder,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             text=True,
             encoding='utf-8',
             errors='ignore'
         )
-        bot_scripts[script_key] = {
-            'process': process,
-            'file_name': file_name,
-            'user_id': script_owner_id,
-            'start_time': datetime.now(),
-            'log_file': log_file,
-            'log_path': log_file_path,
-            'script_key': script_key,
-            'script_path': script_path,
-            'type': 'js'
-        }
-        time.sleep(2)
-        if process.poll() is None:
-            success_msg = f"""
+    except FileNotFoundError:
+        log_file.close()
+        bot.send_message(message_obj.chat.id, "❌ Node.js runtime not found on this host!" if entry_type == 'js' else "❌ Python runtime not found!")
+        return
+
+    bot_scripts[bot_id] = {
+        'process': process,
+        'log_file': log_file,
+        'log_path': log_file_path,
+        'start_time': datetime.now(),
+        'entry_file': entry_file,
+        'entry_type': entry_type,
+        'folder': folder,
+        'user_id': owner_id,
+        'bot_name': bot_name
+    }
+
+    time.sleep(2.5)
+    if process.poll() is None:
+        success_msg = f"""
 ╔══════════════════════════════════════╗
-║     ✅ <b>{BRAND_NAME}: NODE.JS RUNNING</b> ✅  ║
+║     ✅ <b>{BRAND_NAME}: BOT RUNNING</b> ✅    ║
 ╠══════════════════════════════════════╣
-║ 📄 <b>File:</b> <code>{file_name[:25]}</code>
+║ 🤖 <b>Bot:</b> <code>{bot_name[:25]}</code>
 ║ 🆔 <b>PID:</b> {process.pid}
 ║ ⏱️ <b>Started:</b> {datetime.now().strftime('%H:%M:%S')}
 ╚══════════════════════════════════════╝
 """
-            try:
-                bot.edit_message_text(success_msg, message_obj.chat.id, msg.message_id, parse_mode='HTML')
-            except:
-                bot.send_message(message_obj.chat.id, success_msg, parse_mode='HTML')
-        else:
-            log_file.close()
-            with open(log_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                error_output = f.read()[-1000:]
-            match = re.search(r"Cannot find module '(.+?)'", error_output)
-            if match:
-                module_name = match.group(1).strip()
-                if attempt_install_npm(module_name, user_folder, message_obj):
-                    time.sleep(1)
-                    run_js_script(script_path, script_owner_id, user_folder, file_name, message_obj, attempt + 1)
-                    return
-            error_msg = f"""
+        try:
+            bot.edit_message_text(success_msg, message_obj.chat.id, msg.message_id, parse_mode='HTML')
+        except Exception:
+            bot.send_message(message_obj.chat.id, success_msg, parse_mode='HTML')
+        log_action(owner_id, "BOT_START", f"Started {bot_name} (PID: {process.pid})")
+        return
+
+    # Process died almost immediately — read the tail of the log and try to self-heal
+    log_file.close()
+    with open(log_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        error_output = f.read()[-1500:]
+
+    if entry_type == 'py':
+        match = re.search(r"ModuleNotFoundError: No module named '([\w\.\-]+)'", error_output)
+        if match:
+            module_name = match.group(1).strip().split('.')[0]
+            cleanup_script(bot_id)
+            if attempt_install_pip(module_name, message_obj):
+                time.sleep(1)
+                run_bot_instance(bot_entry, message_obj, attempt + 1)
+                return
+    else:
+        match = re.search(r"Cannot find module '(.+?)'", error_output)
+        if match:
+            module_name = match.group(1).strip()
+            cleanup_script(bot_id)
+            if attempt_install_npm(module_name, folder, message_obj):
+                time.sleep(1)
+                run_bot_instance(bot_entry, message_obj, attempt + 1)
+                return
+
+    error_msg = f"""
 ╔══════════════════════════════════════╗
-║     ❌ <b>{BRAND_NAME}: NODE.JS FAILED</b> ❌    ║
+║     ❌ <b>{BRAND_NAME}: BOT FAILED</b> ❌      ║
 ╠══════════════════════════════════════╣
-║ 📄 <b>File:</b> <code>{file_name[:25]}</code>
+║ 🤖 <b>Bot:</b> <code>{bot_name[:25]}</code>
 ║ ❗ <b>Exit Code:</b> {process.returncode}
 ╠══════════════════════════════════════╣
-<code>{error_output[:400]}</code>
+<code>{error_output[:500]}</code>
 ╚══════════════════════════════════════╝
 """
-            try:
-                bot.edit_message_text(error_msg, message_obj.chat.id, msg.message_id, parse_mode='HTML')
-            except:
-                bot.send_message(message_obj.chat.id, error_msg, parse_mode='HTML')
-            cleanup_script(script_key)
-    except FileNotFoundError:
-        bot.send_message(message_obj.chat.id, "❌ Node.js not found!")
-    except Exception as e:
-        logger.error(f"{BRAND_NAME} Error running JS script: {e}")
-        bot.send_message(message_obj.chat.id, f"❌ Error: {str(e)[:200]}")
+    try:
+        bot.edit_message_text(error_msg, message_obj.chat.id, msg.message_id, parse_mode='HTML')
+    except Exception:
+        bot.send_message(message_obj.chat.id, error_msg, parse_mode='HTML')
+    cleanup_script(bot_id)
 
 # ============================================
 # KEYBOARD LAYOUTS
@@ -941,26 +1016,24 @@ def get_main_keyboard(user_id):
         markup.row("📞 Contact Owner")
     return markup
 
-def get_file_actions_keyboard(file_name, is_running=False):
+def get_bot_actions_keyboard(bot_id, is_running=False):
     markup = types.InlineKeyboardMarkup(row_width=2)
     if is_running:
         markup.add(
-            types.InlineKeyboardButton("🛑 Stop", callback_data=f"stop_{file_name}"),
-            types.InlineKeyboardButton("📋 Logs", callback_data=f"logs_{file_name}")
+            types.InlineKeyboardButton("🛑 Stop", callback_data=f"stop_{bot_id}"),
+            types.InlineKeyboardButton("📋 Logs", callback_data=f"logs_{bot_id}")
         )
-        markup.add(
-            types.InlineKeyboardButton("🔄 Restart", callback_data=f"restart_{file_name}")
-        )
+        markup.add(types.InlineKeyboardButton("🔄 Restart", callback_data=f"restart_{bot_id}"))
     else:
         markup.add(
-            types.InlineKeyboardButton("▶️ Run", callback_data=f"run_{file_name}"),
-            types.InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_{file_name}")
+            types.InlineKeyboardButton("▶️ Run", callback_data=f"run_{bot_id}"),
+            types.InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_{bot_id}")
         )
         markup.add(
-            types.InlineKeyboardButton("📥 Download", callback_data=f"download_{file_name}"),
-            types.InlineKeyboardButton("📝 Edit", callback_data=f"edit_{file_name}")
+            types.InlineKeyboardButton("📥 Download", callback_data=f"download_{bot_id}"),
+            types.InlineKeyboardButton("📋 Logs", callback_data=f"logs_{bot_id}")
         )
-        markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="back_to_files"))
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="back_to_files"))
     return markup
 
 # ============================================
@@ -971,7 +1044,7 @@ def get_file_actions_keyboard(file_name, is_running=False):
 def start_command(message):
     user_id = message.from_user.id
     username = message.from_user.username or "Unknown"
-    
+
     referrer_id = None
     if len(message.text.split()) > 1:
         param = message.text.split()[1].strip()
@@ -980,7 +1053,7 @@ def start_command(message):
                 referrer_id = int(param[4:])
             except ValueError:
                 pass
-    
+
     referral_msg = ""
     if referrer_id:
         success, msg = process_referral_link(user_id, referrer_id)
@@ -997,21 +1070,21 @@ def start_command(message):
 
 Start by uploading your first bot! 🚀
 """
-    
+
     initialize_user_points(user_id)
     active_users.add(user_id)
     save_active_user(user_id, username)
     log_action(user_id, "START", "Started the bot")
-    
+
     if bot_locked and user_id not in admin_ids and user_id != OWNER_ID:
         bot.reply_to(message, "🔒 Bot is locked.")
         return
-    
+
     points_data = get_user_points(user_id)
     max_bots = get_user_max_bots(user_id)
     current_bots = get_current_bot_count(user_id)
     referral_link = get_user_referral_link(user_id)
-    
+
     status_text = f"""
 👋 <b>Welcome, {message.from_user.first_name}</b>!
 
@@ -1024,7 +1097,7 @@ Start by uploading your first bot! 🚀
 <b>🔗 Your Referral Link:</b>
 <code>{referral_link}</code>
 """
-    
+
     final_caption = f"""
 <b>🤖 {BRAND_NAME} {BRAND_EMOJI} BOT HOSTING</b>
 
@@ -1036,9 +1109,9 @@ Start by uploading your first bot! 🚀
 
 {status_text}
 
-📢 <b>Use the buttons below to navigate!</b> ⬇️
+📢 <b>Just send a ZIP or any file — it auto-deploys!</b> ⬇️
 """
-    
+
     try:
         bot.send_photo(
             message.chat.id,
@@ -1063,16 +1136,17 @@ def help_command(message):
 ║       📚 <b>{BRAND_NAME} HELP</b> 📚          ║
 ╠══════════════════════════════════════╣
 ║
-║ <b>📤 File Management:</b>
-║ • /upload - Upload a file
-║ • /files - View your files
-║ • /delete - Delete a file
+║ <b>📤 Deploying a bot:</b>
+║ • Just send a .zip — it extracts, installs
+║   deps, finds the entry point, and runs
+║   automatically. No buttons needed.
+║ • Any single file also works (.py/.js run,
+║   anything else is stored as support data).
 ║
 ║ <b>🤖 Bot Control:</b>
-║ • /run - Run a script
-║ • /stop - Stop a running script
-║ • /logs - View script logs
-║ • /running - See running scripts
+║ • /files - View your hosted bots
+║ • /running - See running bots
+║ • /stop - Stop via buttons in /files
 ║
 ║ <b>⭐ Points & Referrals:</b>
 ║ • /points - Check your points
@@ -1082,7 +1156,6 @@ def help_command(message):
 ║ <b>📊 Information:</b>
 ║ • /stats - Bot statistics
 ║ • /speed - Check bot speed
-║ • /status - Your account status
 ║
 ║ <b>🔧 Other:</b>
 ║ • /start - Restart bot
@@ -1098,7 +1171,7 @@ def stats_command(message):
     stats_text = create_system_stats_message()
     try:
         bot.edit_message_text(stats_text, message.chat.id, msg.message_id, parse_mode='HTML')
-    except:
+    except Exception:
         bot.send_message(message.chat.id, stats_text, parse_mode='HTML')
 
 @bot.message_handler(commands=['speed'])
@@ -1124,10 +1197,16 @@ def speed_command(message):
 """
     try:
         bot.edit_message_text(speed_text, message.chat.id, msg.message_id, parse_mode='HTML')
-    except:
+    except Exception:
         bot.send_message(message.chat.id, speed_text, parse_mode='HTML')
 
-@bot.message_handler(commands=['running'])
+@bot.message_handler(commands=['running', 'files'])
+def running_or_files_command(message):
+    if message.text.startswith('/files'):
+        show_user_files(message)
+    else:
+        running_command(message)
+
 def running_command(message):
     user_id = message.from_user.id
     msg = send_spinner_animation(message.chat.id, f"Fetching {BRAND_NAME} bots...", duration=1)
@@ -1137,10 +1216,9 @@ def running_command(message):
             if user_id == OWNER_ID or user_id in admin_ids or info.get('user_id') == user_id:
                 uptime = datetime.now() - info.get('start_time', datetime.now())
                 running_bots.append({
-                    'key': script_key,
-                    'file': info.get('file_name', 'Unknown'),
+                    'name': info.get('bot_name', 'Unknown'),
                     'user': info.get('user_id', 'Unknown'),
-                    'pid': info.get('process', {}).pid if info.get('process') else 'N/A',
+                    'pid': info.get('process').pid if info.get('process') else 'N/A',
                     'uptime': str(uptime).split('.')[0]
                 })
     if running_bots:
@@ -1149,11 +1227,11 @@ def running_command(message):
 ║      🟢 <b>{BRAND_NAME} BOTS</b> 🟢           ║
 ╠══════════════════════════════════════╣
 """
-        for i, bot_info in enumerate(running_bots, 1):
-            text += f"""║ {i}. 📄 <code>{bot_info['file'][:20]}</code>
-║    👤 User: {bot_info['user']}
-║    🆔 PID: {bot_info['pid']}
-║    ⏱️ Uptime: {bot_info['uptime']}
+        for i, info in enumerate(running_bots, 1):
+            text += f"""║ {i}. 🤖 <code>{info['name'][:20]}</code>
+║    👤 User: {info['user']}
+║    🆔 PID: {info['pid']}
+║    ⏱️ Uptime: {info['uptime']}
 ║ ──────────────────────────────────
 """
         text += "╚══════════════════════════════════════╝"
@@ -1163,14 +1241,14 @@ def running_command(message):
 ║      🔴 <b>NO {BRAND_NAME} BOTS</b> 🔴        ║
 ╠══════════════════════════════════════╣
 ║
-║  No scripts are currently running.
-║  Upload a file and run it!
+║  No bots are currently running.
+║  Upload a ZIP or file to deploy one!
 ║
 ╚══════════════════════════════════════╝
 """
     try:
         bot.edit_message_text(text, message.chat.id, msg.message_id, parse_mode='HTML')
-    except:
+    except Exception:
         bot.send_message(message.chat.id, text, parse_mode='HTML')
 
 @bot.message_handler(commands=['points'])
@@ -1183,8 +1261,7 @@ def referral_command(message):
 
 @bot.message_handler(commands=['referrals'])
 def referrals_command(message):
-    user_id = message.from_user.id
-    show_referral_history_for_command(message, user_id)
+    show_referral_history_for_command(message, message.from_user.id)
 
 @bot.message_handler(commands=['lock'])
 def lock_command(message):
@@ -1239,17 +1316,17 @@ def process_broadcast(message):
 """
             bot.send_message(user_id, formatted_msg, parse_mode='HTML')
             success += 1
-        except:
+        except Exception:
             failed += 1
-        if (i + 1) % 10 == 0:
+        if (i + 1) % 10 == 0 and total > 0:
             try:
-                bar = "🟩" * ((i + 1) // (total // 4) if total > 0 else 0) + "⬜" * (4 - (i + 1) // (total // 4) if total > 0 else 4)
-                bar = bar[:4].ljust(4, "⬜")
+                filled = min(4, (i + 1) // max(1, total // 4))
+                bar = ("🟩" * filled).ljust(4, "⬜")
                 bot.edit_message_text(
                     f"⚙️ Loading... ({int((i+1)/total*100)}%)\n[{bar}] Broadcasting...",
                     message.chat.id, progress_msg.message_id
                 )
-            except:
+            except Exception:
                 pass
     result_text = f"""
 ╔══════════════════════════════════════╗
@@ -1264,7 +1341,7 @@ def process_broadcast(message):
 """
     try:
         bot.edit_message_text(result_text, message.chat.id, progress_msg.message_id, parse_mode='HTML')
-    except:
+    except Exception:
         bot.send_message(message.chat.id, result_text, parse_mode='HTML')
 
 @bot.message_handler(commands=['subscribe'])
@@ -1300,7 +1377,7 @@ def subscribe_command(message):
     send_animated_message(message.chat.id, sub_text, "loading", duration=1)
     try:
         bot.send_message(target_user, f"🎉 You've been subscribed for {days} days by {BRAND_NAME}!")
-    except:
+    except Exception:
         pass
 
 @bot.message_handler(commands=['addpoints'])
@@ -1340,19 +1417,18 @@ def add_points_command(message):
 
 Keep going! Share your referral link for more! 🚀
 """, parse_mode='HTML')
-        except:
+        except Exception:
             pass
     else:
         bot.reply_to(message, "❌ Failed to add points!")
 
 @bot.message_handler(commands=['setbanner'])
 def set_banner_command(message):
-    """Set new banner image (Admin only)"""
     user_id = message.from_user.id
     if user_id != OWNER_ID and user_id not in admin_ids:
         bot.reply_to(message, "❌ Admin only!")
         return
-    
+
     parts = message.text.split()
     if len(parts) < 2:
         bot.reply_to(message, """
@@ -1360,91 +1436,67 @@ def set_banner_command(message):
 
 <b>Example:</b>
 /setbanner https://telegra.ph/file/your-image.jpg
-
-<b>Supported Hosts:</b>
-• https://telegra.ph/
-• https://imgur.com/
-• https://postimg.cc/
-• Any direct image URL
 """, parse_mode='HTML')
         return
-    
+
     global START_IMAGE_URL
     new_url = parts[1].strip()
-    
+
     if not new_url.startswith(('http://', 'https://')):
         bot.reply_to(message, "❌ Invalid URL! Must start with http:// or https://")
         return
-    
+
     try:
         response = requests.head(new_url, timeout=10)
         if response.status_code != 200:
             bot.reply_to(message, f"❌ Image not accessible! Status: {response.status_code}")
             return
-    except:
+    except Exception:
         bot.reply_to(message, "❌ Cannot access the URL! Please check and try again.")
         return
-    
+
     START_IMAGE_URL = new_url
     bot.reply_to(message, f"""
 ✅ <b>Banner Updated!</b>
 
 🖼️ <b>New Banner:</b>
 <code>{START_IMAGE_URL}</code>
-
-💡 <b>Test it:</b> Send /start to see the new banner!
 """, parse_mode='HTML')
-    
+
     log_action(user_id, "BANNER_CHANGE", f"Changed banner to {START_IMAGE_URL}")
 
 @bot.message_handler(commands=['setdesc'])
 def set_description_command(message):
-    """Set new start description (Admin only)"""
     user_id = message.from_user.id
     if user_id != OWNER_ID and user_id not in admin_ids:
         bot.reply_to(message, "❌ Admin only!")
         return
-    
+
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         bot.reply_to(message, """
 📖 <b>Usage:</b> /setdesc &lt;description&gt;
-
-<b>Example:</b>
-/setdesc 🚀 Upload & Host Your Bots
-📤 Python • Node.js • ZIP
-⭐ Earn Points • Refer & Win
-
-<b>Use HTML tags:</b>
-• <b>bold</b>
-• <i>italic</i>
-• <code>code</code>
 """, parse_mode='HTML')
         return
-    
+
     global START_DESCRIPTION
-    new_desc = parts[1].strip()
-    
-    START_DESCRIPTION = new_desc
+    START_DESCRIPTION = parts[1].strip()
     bot.reply_to(message, f"""
 ✅ <b>Description Updated!</b>
 
 📝 <b>New Description:</b>
-{new_desc}
-
-💡 <b>Test it:</b> Send /start to see the new description!
+{START_DESCRIPTION}
 """, parse_mode='HTML')
-    
-    log_action(user_id, "DESC_CHANGE", f"Changed description")
+
+    log_action(user_id, "DESC_CHANGE", "Changed description")
 
 @bot.message_handler(commands=['settings'])
 def settings_command(message):
-    """View current start settings (Admin only)"""
     user_id = message.from_user.id
     if user_id != OWNER_ID and user_id not in admin_ids:
         bot.reply_to(message, "❌ Admin only!")
         return
-    
+
     settings_text = f"""
 ⚙️ <b>Current Start Settings</b>
 
@@ -1453,15 +1505,7 @@ def settings_command(message):
 
 📝 <b>Description:</b>
 {START_DESCRIPTION}
-
-━━━━━━━━━━━━━━━━━━━━━━━━
-
-<b>Commands:</b>
-• /setbanner &lt;url&gt; - Change banner
-• /setdesc &lt;text&gt; - Change description
-• /settings - View settings
 """
-    
     bot.send_message(message.chat.id, settings_text, parse_mode='HTML')
 
 # ============================================
@@ -1473,11 +1517,11 @@ def handle_text(message):
     user_id = message.from_user.id
     text = message.text
     active_users.add(user_id)
-    
+
     if bot_locked and user_id not in admin_ids and user_id != OWNER_ID:
         bot.reply_to(message, "🔒 Bot is locked!")
         return
-    
+
     if text == "📢 Updates Channel":
         bot.send_message(message.chat.id, f"📢 Join our {BRAND_NAME} updates:\n{UPDATE_CHANNEL}")
     elif text == "📤 Upload File":
@@ -1510,7 +1554,7 @@ def handle_text(message):
 def handle_upload_request(message):
     user_id = message.from_user.id
     can_upload, status = can_user_upload(user_id)
-    
+
     if not can_upload:
         points_data = get_user_points(user_id)
         needed = 5 - (points_data['points'] % 5)
@@ -1522,32 +1566,29 @@ def handle_upload_request(message):
 • Max Bots: {get_user_max_bots(user_id)}
 • Points: {points_data['points']}
 
-💡 <b>How to get more slots:</b>
-1. Share your referral link
-2. Get 1 point per referral
-3. 5 points = 1 extra bot slot
-
 🎯 <b>You need {needed} more points!</b>
 Use 🎯 Referral System to get more!
 """, parse_mode='HTML')
         return
-    
-    current_count = get_user_file_count(user_id)
-    limit = get_user_file_limit(user_id)
-    
+
     upload_text = f"""
 ╔══════════════════════════════════════╗
 ║       📤 <b>{BRAND_NAME}: FILE UPLOAD</b> 📤   ║
 ╠══════════════════════════════════════╣
 ║
-║  Send your file now!
+║  Send your ZIP or any file now!
 ║
-║  <b>Supported formats:</b>
-║  • Python (.py)
-║  • JavaScript (.js)
-║  • ZIP archives (.zip)
+║  <b>ZIP uploads:</b> auto-extracted, entry
+║  point auto-detected, dependencies
+║  auto-installed, and it auto-runs.
 ║
-║  📁 Files: {current_count}/{int(limit) if limit != float('inf') else '∞'}
+║  <b>Any other file:</b> stored, and if it's
+║  .py/.js it runs automatically too.
+║
+║  📌 <b>1 upload = 1 bot slot</b> — whether
+║  it's a single file or a whole ZIP.
+║
+║  📁 Bots: {get_current_bot_count(user_id)}/{int(get_user_max_bots(user_id)) if get_user_max_bots(user_id) != float('inf') else '∞'}
 ║  ⭐ Points: {get_user_points(user_id)['points']}
 ║
 ╚══════════════════════════════════════╝
@@ -1556,45 +1597,44 @@ Use 🎯 Referral System to get more!
 
 def show_user_files(message):
     user_id = message.from_user.id
-    msg = send_spinner_animation(message.chat.id, f"Loading {BRAND_NAME} files...", duration=1)
-    files = user_files.get(user_id, [])
-    if not files:
+    msg = send_spinner_animation(message.chat.id, f"Loading {BRAND_NAME} bots...", duration=1)
+    bots = user_bots.get(user_id, [])
+    if not bots:
         text = f"""
 ╔══════════════════════════════════════╗
-║       📂 <b>{BRAND_NAME}: YOUR FILES</b> 📂   ║
+║       📂 <b>{BRAND_NAME}: YOUR BOTS</b> 📂    ║
 ╠══════════════════════════════════════╣
 ║
-║  You haven't uploaded any files yet!
-║
-║  Use 📤 Upload File to get started.
+║  You haven't hosted any bots yet!
+║  Send a ZIP or any file to get started.
 ║
 ╚══════════════════════════════════════╝
 """
         try:
             bot.edit_message_text(text, message.chat.id, msg.message_id, parse_mode='HTML')
-        except:
+        except Exception:
             bot.send_message(message.chat.id, text, parse_mode='HTML')
         return
-    
+
     text = f"""
 ╔══════════════════════════════════════╗
-║       📂 <b>{BRAND_NAME}: YOUR FILES</b> 📂   ║
+║       📂 <b>{BRAND_NAME}: YOUR BOTS</b> 📂    ║
 ╠══════════════════════════════════════╣
 """
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    for i, (file_name, file_type) in enumerate(files, 1):
-        is_running = is_bot_running(user_id, file_name)
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for i, b in enumerate(bots, 1):
+        is_running = is_bot_running_check(b['bot_id'])
         status = "🟢" if is_running else "🔴"
-        type_icon = "🐍" if file_type == "py" else "🟨" if file_type == "js" else "📦"
-        text += f"║ {i}. {status} {type_icon} <code>{file_name[:25]}</code>\n"
+        type_icon = "🐍" if b['entry_type'] == 'py' else "🟨" if b['entry_type'] == 'js' else "📦"
+        text += f"║ {i}. {status} {type_icon} <code>{b['bot_name'][:25]}</code>\n"
         markup.add(types.InlineKeyboardButton(
-            f"{status} {file_name[:15]}",
-            callback_data=f"file_{file_name}"
+            f"{status} {type_icon} {b['bot_name'][:25]}",
+            callback_data=f"bot_{b['bot_id']}"
         ))
-    text += "╚══════════════════════════════════════╝\nSelect a file for actions:"
+    text += "╚══════════════════════════════════════╝\nSelect a bot for actions:"
     try:
         bot.edit_message_text(text, message.chat.id, msg.message_id, parse_mode='HTML', reply_markup=markup)
-    except:
+    except Exception:
         bot.send_message(message.chat.id, text, parse_mode='HTML', reply_markup=markup)
 
 def show_subscriptions(message):
@@ -1628,7 +1668,7 @@ def show_admin_panel(message):
     if user_id != OWNER_ID and user_id not in admin_ids:
         bot.reply_to(message, "❌ Admin only!")
         return
-    
+
     try:
         conn = get_db_connection()
         c = conn.cursor()
@@ -1639,14 +1679,14 @@ def show_admin_panel(message):
         c.execute('SELECT COUNT(*) FROM referrals')
         total_referrals = c.fetchone()[0]
         conn.close()
-    except:
+    except Exception:
         total_users_with_points = 0
         total_points = 0
         total_referrals = 0
-    
-    total_files = sum(len(files) for files in user_files.values())
-    total_users = len(user_files)
-    
+
+    total_bots = sum(len(b) for b in user_bots.values())
+    total_users = len(user_bots)
+
     admin_text = f"""
 ╔══════════════════════════════════════╗
 ║       👑 <b>{BRAND_NAME}: ADMIN PANEL</b> 👑   ║
@@ -1654,8 +1694,8 @@ def show_admin_panel(message):
 ║
 ║  <b>📊 General Statistics:</b>
 ║  • Total Users: {len(active_users)}
-║  • Users with Files: {total_users}
-║  • Total Files: {total_files}
+║  • Users with Bots: {total_users}
+║  • Total Bots: {total_bots}
 ║  • Active Subs: {len([u for u, d in user_subscriptions.items() if d['expiry'] > datetime.now()])}
 ║  • Running Bots: {len([k for k in bot_scripts if is_bot_running_check(k)])}
 ║
@@ -1664,23 +1704,11 @@ def show_admin_panel(message):
 ║  • Total Points: {total_points}
 ║  • Total Referrals: {total_referrals}
 ║
-║  <b>🔧 Commands:</b>
-║  • /broadcast - Send to all
-║  • /subscribe - Add subscription
-║  • /lock - Lock/unlock bot
-║  • /addadmin - Add admin
-║  • /removeadmin - Remove admin
-║  • /stopall - Stop all bots
-║  • /addpoints - Add points to user
-║  • /setbanner - Change banner
-║  • /setdesc - Change description
-║  • /settings - View settings
-║
 ╚══════════════════════════════════════╝
 """
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        types.InlineKeyboardButton("📂 All User Files", callback_data="admin_view_all_files"),
+        types.InlineKeyboardButton("📂 All User Bots", callback_data="admin_view_all_files"),
         types.InlineKeyboardButton("🏆 Top Referrers", callback_data="admin_top_referrers"),
         types.InlineKeyboardButton("🛑 Stop All Bots", callback_data="admin_stopall"),
         types.InlineKeyboardButton("🔄 Refresh", callback_data="admin_refresh"),
@@ -1697,13 +1725,13 @@ def show_my_points(message):
     current_bots = get_current_bot_count(user_id)
     referral_link = get_user_referral_link(user_id)
     ref_stats = get_referral_stats(user_id)
-    
+
     points = points_data['points']
     points_needed = 5 - (points % 5) if max_bots != float('inf') else 0
     progress = (points % 5) / 5 * 100 if max_bots != float('inf') else 100
     filled = int((points % 5) / 5 * 10) if max_bots != float('inf') else 10
     bar = "█" * filled + "░" * (10 - filled)
-    
+
     status_text = f"""
 ╔══════════════════════════════════════╗
 ║        ⭐ <b>{BRAND_NAME}: MY POINTS</b> ⭐      ║
@@ -1725,27 +1753,22 @@ def show_my_points(message):
             status_text += f"║  ⏳ <b>Need {points_needed} more points</b>\n"
     else:
         status_text += "║  👑 <b>Unlimited (Admin/Owner)</b>\n"
-    
+
     status_text += f"""
 ║
 ║  🔗 <b>Your Referral Link:</b>
 ║  <code>{referral_link}</code>
 ║
-║  💡 <b>How it works:</b>
-║  • Share your referral link
-║  • Get 1 point per referral
-║  • 5 points = 1 extra bot slot
-║
 ╚══════════════════════════════════════╝
 """
-    
+
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("📤 Share Referral", callback_data="share_referral"),
         types.InlineKeyboardButton("📊 Referral History", callback_data="referral_history")
     )
     markup.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="refresh_points"))
-    
+
     bot.send_message(message.chat.id, status_text, parse_mode='HTML', reply_markup=markup)
 
 def show_referral_system(message):
@@ -1753,14 +1776,12 @@ def show_referral_system(message):
     initialize_user_points(user_id)
     referral_link = get_user_referral_link(user_id)
     ref_stats = get_referral_stats(user_id)
-    
+
     text = f"""
 ╔══════════════════════════════════════╗
 ║      🎯 <b>{BRAND_NAME}: REFERRAL SYSTEM</b> 🎯   ║
 ╠══════════════════════════════════════╣
 ║
-║  <b>📋 How It Works:</b>
-║  
 ║  1️⃣ Share your referral link
 ║  2️⃣ Friend clicks and joins
 ║  3️⃣ You get <b>1 point</b> ✨
@@ -1773,36 +1794,29 @@ def show_referral_system(message):
 ║  <b>🔗 Your Link:</b>
 ║  <code>{referral_link}</code>
 ║
-║  <b>💡 Pro Tip:</b>
-║  Share in Telegram groups!
-║  Each referral = closer to more bots!
-║
 ╚══════════════════════════════════════╝
 """
-    
+
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("📤 Share Link", callback_data="share_referral"),
         types.InlineKeyboardButton("📊 My Referrals", callback_data="referral_history")
     )
     markup.add(types.InlineKeyboardButton("⭐ My Points", callback_data="refresh_points"))
-    
+
     bot.send_message(message.chat.id, text, parse_mode='HTML', reply_markup=markup)
 
 def show_referral_history_for_command(message, user_id):
     ref_stats = get_referral_stats(user_id)
-    
+
     if ref_stats['total'] == 0:
-        text = """
+        bot.send_message(message.chat.id, """
 📊 <b>No Referrals Yet</b>
 
 Start sharing your referral link to earn points!
-Each referral = 1 point ✨
-5 points = 1 extra bot slot 🚀
-"""
-        bot.send_message(message.chat.id, text, parse_mode='HTML')
+""", parse_mode='HTML')
         return
-    
+
     text = f"""
 ╔══════════════════════════════════════╗
 ║     📊 <b>REFERRAL HISTORY</b> 📊          ║
@@ -1813,78 +1827,44 @@ Each referral = 1 point ✨
 ║
 ║  <b>Recent Referrals:</b>
 """
-    
     for i, (referred_id, timestamp) in enumerate(ref_stats['recent'][:10], 1):
-        username = "Unknown"
-        try:
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute('SELECT username FROM active_users WHERE user_id = ?', (referred_id,))
-            result = c.fetchone()
-            if result:
-                username = result[0] or str(referred_id)
-            conn.close()
-        except:
-            pass
+        username = _lookup_username(referred_id)
         text += f"║  {i}. 👤 {username} ({referred_id})\n"
         text += f"║     🕐 {timestamp[:16]}\n"
-    
-    text += """
-╚══════════════════════════════════════╝
-"""
+    text += "╚══════════════════════════════════════╝"
     bot.send_message(message.chat.id, text, parse_mode='HTML')
 
+def _lookup_username(uid):
+    username = "Unknown"
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('SELECT username FROM active_users WHERE user_id = ?', (uid,))
+        result = c.fetchone()
+        if result:
+            username = result[0] or str(uid)
+        conn.close()
+    except Exception:
+        pass
+    return username
+
 # ============================================
-# FILE UPLOAD HANDLER (UPDATED)
+# FILE / ZIP UPLOAD HANDLER — the core upgrade
 # ============================================
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     user_id = message.from_user.id
-    
-    # Check if user can upload
+
     can_upload, status = can_user_upload(user_id)
     if not can_upload:
         bot.reply_to(message, f"❌ Can't upload! {status}")
         return
-    
-    file_name = message.document.file_name
-    file_size = message.document.file_size
-    file_ext = file_name.split('.')[-1].lower() if '.' in file_name else ''
-    allowed_extensions = ['py', 'js', 'zip', 'json', 'txt', 'env', 'yml', 'yaml']
-    
-    if file_ext not in allowed_extensions:
-        bot.reply_to(message, f"❌ Unsupported type: .{file_ext}")
-        return
-    
-    # ============================================
-    # ZIP FILE = 1 SLOT CHECK
-    # ============================================
-    if file_ext == 'zip':
-        current_bots = get_current_bot_count(user_id)
-        max_bots = get_user_max_bots(user_id)
-        
-        if current_bots >= max_bots:
-            points_data = get_user_points(user_id)
-            needed = 5 - (points_data['points'] % 5)
-            bot.reply_to(message, f"""
-❌ <b>Can't Upload ZIP!</b>
 
-📊 <b>Your Status:</b>
-• Current Bots: {current_bots}
-• Max Bots: {max_bots}
-• Points: {points_data['points']}
+    file_name = message.document.file_name or f"file_{uuid.uuid4().hex[:8]}"
+    file_size = message.document.file_size or 0
+    file_ext = file_name.split('.')[-1].lower() if '.' in file_name else 'bin'
 
-💡 <b>ZIP file counts as 1 bot slot!</b>
-Even if it contains multiple files.
-
-🎯 <b>You need {needed} more points!</b>
-""", parse_mode='HTML')
-            return
-    
-    # ============================================
-    # UPLOAD PROGRESS
-    # ============================================
     upload_text = f"""
 ╔══════════════════════════════════════╗
 ║      📤 <b>{BRAND_NAME}: UPLOADING</b> 📤     ║
@@ -1895,238 +1875,131 @@ Even if it contains multiple files.
 ║
 """
     progress_msg = bot.reply_to(message, upload_text + "║  ⏳ Downloading...\n╚══════════════════════════════════════╝", parse_mode='HTML')
-    
+
     try:
         file_info = bot.get_file(message.document.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
-        
-        try:
-            bot.edit_message_text(
-                upload_text + "║  📥 Processing...\n╚══════════════════════════════════════╝",
-                message.chat.id, progress_msg.message_id, parse_mode='HTML'
-            )
-        except:
-            pass
-        
-        user_folder = get_user_folder(user_id)
-        file_path = os.path.join(user_folder, file_name)
-        
-        # ============================================
-        # ZIP FILE HANDLING
-        # ============================================
-        if file_ext == 'zip':
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp:
-                tmp.write(downloaded_file)
-                tmp_path = tmp.name
-            
-            try:
-                with zipfile.ZipFile(tmp_path, 'r') as zip_ref:
-                    zip_ref.extractall(user_folder)
-                    os.unlink(tmp_path)
-                
-                # FIND ALL FILES
-                extracted_py_files = []
-                extracted_js_files = []
-                extracted_other_files = []
-                
-                for root, dirs, files in os.walk(user_folder):
-                    for f in files:
-                        if f.endswith('.py'):
-                            extracted_py_files.append(f)
-                        elif f.endswith('.js'):
-                            extracted_js_files.append(f)
-                        else:
-                            extracted_other_files.append(f)
-                
-                # SAVE ALL FILES TO DATABASE (1 SLOT)
-                if user_id not in user_files:
-                    user_files[user_id] = []
-                
-                all_files = extracted_py_files + extracted_js_files + extracted_other_files
-                for f in all_files:
-                    ftype = f.split('.')[-1] if '.' in f else 'txt'
-                    if (f, ftype) not in user_files[user_id]:
-                        user_files[user_id].append((f, ftype))
-                        save_user_file_db(user_id, f, ftype, 0)
-                
-                # AUTO-RUN FILES (LIMITED TO AVAILABLE SLOTS)
-                max_bots = get_user_max_bots(user_id)
-                current_bots = get_current_bot_count(user_id)
-                available_slots = max_bots - current_bots if max_bots != float('inf') else 999
-                
-                files_to_run = extracted_py_files + extracted_js_files
-                files_to_run = files_to_run[:available_slots]
-                
-                running_count = 0
-                failed_count = 0
-                running_files = []
-                failed_files = []
-                
-                for file_to_run in files_to_run:
-                    try:
-                        script_path = os.path.join(user_folder, file_to_run)
-                        if os.path.exists(script_path):
-                            ftype = file_to_run.split('.')[-1]
-                            if ftype == 'py':
-                                threading.Thread(
-                                    target=run_script,
-                                    args=(script_path, user_id, user_folder, file_to_run, message)
-                                ).start()
-                            elif ftype == 'js':
-                                threading.Thread(
-                                    target=run_js_script,
-                                    args=(script_path, user_id, user_folder, file_to_run, message)
-                                ).start()
-                            running_count += 1
-                            running_files.append(file_to_run)
-                            time.sleep(0.3)
-                    except Exception as e:
-                        failed_count += 1
-                        failed_files.append(file_to_run)
-                        logger.error(f"Failed to run {file_to_run}: {e}")
-                
-                # BUILD FILE LIST
-                file_list = ""
-                for f in all_files[:10]:
-                    ftype = f.split('.')[-1] if '.' in f else 'txt'
-                    icon = "🐍" if ftype == "py" else "🟨" if ftype == "js" else "📄"
-                    status_icon = "🟢" if f in running_files else "🔴"
-                    file_list += f"║  {status_icon} {icon} <code>{f[:25]}</code>\n"
-                
-                if len(all_files) > 10:
-                    file_list += f"║  ... and {len(all_files) - 10} more files\n"
-                
-                # SUCCESS MESSAGE
-                success_text = f"""
-╔══════════════════════════════════════╗
-║      ✅ <b>ZIP EXTRACTED & HOSTED!</b> ✅    ║
-╠══════════════════════════════════════╣
-║
-║  📁 <b>Total Files:</b> {len(all_files)}
-║  🐍 Python: {len(extracted_py_files)}
-║  🟨 JavaScript: {len(extracted_js_files)}
-║  📄 Other: {len(extracted_other_files)}
-║
-║  🚀 <b>Auto-Hosted:</b> {running_count} scripts
-║  ❌ <b>Failed:</b> {failed_count}
-║
-║  💡 <b>ZIP counts as 1 bot slot!</b>
-║  🤖 <b>Slots Used:</b> {current_bots + 1}/{max_bots if max_bots != float('inf') else '∞'}
-║
-╠══════════════════════════════════════╣
-{file_list}
-╚══════════════════════════════════════╝
-"""
-                
-                # INLINE BUTTONS
-                markup = types.InlineKeyboardMarkup(row_width=2)
-                markup.add(
-                    types.InlineKeyboardButton("📂 View All Files", callback_data="back_to_files"),
-                    types.InlineKeyboardButton("🟢 Running Bots", callback_data="view_running")
-                )
-                
-                if failed_count > 0:
-                    markup.add(types.InlineKeyboardButton("🔄 Retry Failed", callback_data=f"retry_failed_{user_id}"))
-                
-                if running_count > 0:
-                    markup.add(types.InlineKeyboardButton("🛑 Stop All", callback_data=f"stop_all_{user_id}"))
-                
-                try:
-                    bot.edit_message_text(success_text, message.chat.id, progress_msg.message_id,
-                                          parse_mode='HTML', reply_markup=markup)
-                except:
-                    bot.send_message(message.chat.id, success_text, parse_mode='HTML', reply_markup=markup)
-                
-            except zipfile.BadZipFile:
-                bot.edit_message_text(
-                    upload_text + "║  ❌ Invalid ZIP!\n╚══════════════════════════════════════╝",
-                    message.chat.id, progress_msg.message_id, parse_mode='HTML'
-                )
-                return
-        
-        # ============================================
-        # SINGLE FILE HANDLING
-        # ============================================
-        else:
-            # Check if user has slots
-            current_bots = get_current_bot_count(user_id)
-            max_bots = get_user_max_bots(user_id)
-            
-            if current_bots >= max_bots:
-                bot.edit_message_text(
-                    upload_text + f"║  ❌ No slots left!\n║  🤖 {current_bots}/{max_bots}\n╚══════════════════════════════════════╝",
-                    message.chat.id, progress_msg.message_id, parse_mode='HTML'
-                )
-                return
-            
-            with open(file_path, 'wb') as f:
-                f.write(downloaded_file)
-            
-            if user_id not in user_files:
-                user_files[user_id] = []
-            user_files[user_id] = [(n, t) for n, t in user_files[user_id] if n != file_name]
-            user_files[user_id].append((file_name, file_ext))
-            save_user_file_db(user_id, file_name, file_ext, file_size)
-            
-            # Auto-run single file
-            running_msg = ""
-            if file_ext in ['py', 'js']:
-                try:
-                    if file_ext == 'py':
-                        threading.Thread(
-                            target=run_script,
-                            args=(file_path, user_id, user_folder, file_name, message)
-                        ).start()
-                    else:
-                        threading.Thread(
-                            target=run_js_script,
-                            args=(file_path, user_id, user_folder, file_name, message)
-                        ).start()
-                    running_msg = "\n  🚀 Script started automatically!"
-                except Exception as e:
-                    running_msg = f"\n  ❌ Failed to start: {str(e)[:30]}"
-            
-            success_text = upload_text + f"""║  ✅ Upload Complete!{running_msg}
-║  🤖 Slots Used: {current_bots + 1}/{max_bots if max_bots != float('inf') else '∞'}
-╚══════════════════════════════════════╝
-"""
-            
-            markup = types.InlineKeyboardMarkup(row_width=2)
-            if file_ext in ['py', 'js']:
-                markup.add(
-                    types.InlineKeyboardButton("▶️ Run Now", callback_data=f"run_{file_name}"),
-                    types.InlineKeyboardButton("📂 View Files", callback_data="back_to_files")
-                )
-            else:
-                markup.add(types.InlineKeyboardButton("📂 View Files", callback_data="back_to_files"))
-            
-            try:
-                bot.edit_message_text(success_text, message.chat.id, progress_msg.message_id,
-                                      parse_mode='HTML', reply_markup=markup)
-            except:
-                bot.send_message(message.chat.id, success_text, parse_mode='HTML', reply_markup=markup)
-                
     except Exception as e:
-        logger.error(f"{BRAND_NAME} Upload error: {e}")
+        logger.error(f"{BRAND_NAME} Download error: {e}")
         try:
             bot.edit_message_text(
-                upload_text + f"║  ❌ Error: {str(e)[:30]}\n╚══════════════════════════════════════╝",
+                upload_text + f"║  ❌ Download failed: {str(e)[:40]}\n╚══════════════════════════════════════╝",
                 message.chat.id, progress_msg.message_id, parse_mode='HTML'
             )
-        except:
+        except Exception:
+            pass
+        return
+
+    try:
+        bot.edit_message_text(
+            upload_text + "║  📥 Processing...\n╚══════════════════════════════════════╝",
+            message.chat.id, progress_msg.message_id, parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+    # Every upload gets its own isolated folder — prevents filename clashes between bots
+    bot_id = f"{user_id}_{uuid.uuid4().hex[:10]}"
+    folder_name = bot_id
+    user_folder = get_user_folder(user_id)
+    bot_folder = os.path.join(user_folder, folder_name)
+    os.makedirs(bot_folder, exist_ok=True)
+
+    try:
+        if file_ext == 'zip':
+            tmp_zip = os.path.join(TMP_DIR, f"{bot_id}.zip")
+            with open(tmp_zip, 'wb') as f:
+                f.write(downloaded_file)
+
+            try:
+                with zipfile.ZipFile(tmp_zip, 'r') as zip_ref:
+                    zip_ref.extractall(bot_folder)
+            except zipfile.BadZipFile:
+                shutil.rmtree(bot_folder, ignore_errors=True)
+                os.remove(tmp_zip)
+                bot.edit_message_text(
+                    upload_text + "║  ❌ Invalid or corrupted ZIP!\n╚══════════════════════════════════════╝",
+                    message.chat.id, progress_msg.message_id, parse_mode='HTML'
+                )
+                return
+            finally:
+                if os.path.exists(tmp_zip):
+                    os.remove(tmp_zip)
+
+            flatten_single_wrapper_folder(bot_folder)
+            bot_name = file_name.rsplit('.', 1)[0]
+        else:
+            # ANY extension is accepted and stored — .py/.js run, everything else is support data
+            target_path = os.path.join(bot_folder, file_name)
+            with open(target_path, 'wb') as f:
+                f.write(downloaded_file)
+            bot_name = file_name
+
+        file_count = count_files(bot_folder)
+        entry_file, entry_type = find_entry_point(bot_folder)
+
+        user_bots.setdefault(user_id, []).append({
+            'bot_id': bot_id,
+            'bot_name': bot_name,
+            'folder': bot_folder,
+            'folder_name': folder_name,
+            'entry_file': entry_file,
+            'entry_type': entry_type,
+            'file_count': file_count,
+            'upload_time': datetime.now().isoformat()
+        })
+        save_hosted_bot_db(bot_id, user_id, bot_name, folder_name, entry_file, entry_type, file_count)
+
+        entry_display = entry_file if entry_file else "None found"
+        success_text = upload_text + f"""║  ✅ Deployed!
+║  📁 Files: {file_count}
+║  🎯 Entry: <code>{entry_display[:25] if entry_file else entry_display}</code>
+╚══════════════════════════════════════╝
+"""
+        try:
+            bot.edit_message_text(success_text, message.chat.id, progress_msg.message_id, parse_mode='HTML')
+        except Exception:
+            bot.send_message(message.chat.id, success_text, parse_mode='HTML')
+
+    except Exception as e:
+        logger.error(f"{BRAND_NAME} Upload/extract error: {e}")
+        shutil.rmtree(bot_folder, ignore_errors=True)
+        try:
+            bot.edit_message_text(
+                upload_text + f"║  ❌ Error: {str(e)[:40]}\n╚══════════════════════════════════════╝",
+                message.chat.id, progress_msg.message_id, parse_mode='HTML'
+            )
+        except Exception:
             bot.reply_to(message, f"❌ Upload failed: {str(e)[:100]}")
+        return
+
+    bot_entry = find_bot_by_id(user_id, bot_id)
+    if not bot_entry:
+        return
+
+    # Auto-install bulk deps (requirements.txt / package.json) then auto-run — no button press needed
+    threading.Thread(target=_deploy_and_run, args=(bot_entry, message)).start()
+
+def _deploy_and_run(bot_entry, message):
+    auto_install_bulk_dependencies(bot_entry['folder'], message)
+    if bot_entry['entry_file']:
+        run_bot_instance(bot_entry, message)
+    else:
+        bot.send_message(
+            message.chat.id,
+            f"📦 <b>{bot_entry['bot_name']}</b> stored — no runnable .py/.js entry point was found in it, "
+            f"so nothing was started. Use 📂 Check Files to inspect or download it.",
+            parse_mode='HTML'
+        )
 
 # ============================================
-# CALLBACK QUERY HANDLER (UPDATED)
+# CALLBACK QUERY HANDLER
 # ============================================
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
-    user_id = call.from_user.id
     data = call.data
-    
     try:
-        # --- Referral callbacks ---
         if data == "share_referral":
             share_referral(call)
         elif data == "referral_history":
@@ -2135,60 +2008,31 @@ def handle_callback(call):
             refresh_points(call)
         elif data == "copy_referral_link":
             copy_referral_link(call)
-        
-        # --- NEW: View Running ---
-        elif data == "view_running":
-            class FakeMessage:
-                def __init__(self, call):
-                    self.chat = call.message.chat
-                    self.from_user = call.from_user
-            running_command(FakeMessage(call))
-            bot.answer_callback_query(call.id)
-        
-        # --- NEW: Retry Failed ---
-        elif data.startswith("retry_failed_"):
-            target_user = int(data[13:])
-            retry_failed_scripts(call, target_user)
-        
-        # --- NEW: Stop All ---
-        elif data.startswith("stop_all_"):
-            target_user = int(data[9:])
-            stop_all_user_scripts(call, target_user)
-        
-        # --- File callbacks ---
-        elif data.startswith("file_"):
-            file_name = data[5:]
-            show_file_actions(call, file_name)
+
+        elif data.startswith("bot_"):
+            show_bot_actions(call, data[4:])
         elif data.startswith("run_"):
-            file_name = data[4:]
-            run_user_script(call, file_name)
+            run_user_bot(call, data[4:])
         elif data.startswith("stop_"):
-            file_name = data[5:]
-            stop_user_script(call, file_name)
+            stop_user_bot(call, data[5:])
         elif data.startswith("delete_"):
-            file_name = data[7:]
-            delete_user_file(call, file_name)
-        elif data.startswith("download_"):
-            file_name = data[9:]
-            download_user_file(call, file_name)
-        elif data.startswith("logs_"):
-            file_name = data[5:]
-            show_script_logs(call, file_name)
-        elif data.startswith("restart_"):
-            file_name = data[8:]
-            restart_user_script(call, file_name)
-        elif data == "back_to_files":
-            show_user_files_callback(call)
+            delete_user_bot_confirm(call, data[7:])
         elif data.startswith("confirm_delete_"):
-            file_name = data[15:]
-            confirm_delete_file(call, file_name)
+            confirm_delete_bot(call, data[15:])
         elif data.startswith("cancel_delete_"):
             bot.answer_callback_query(call.id, "❌ Cancelled")
             show_user_files_callback(call)
-        
-        # --- Admin callbacks ---
+        elif data.startswith("download_"):
+            download_user_bot(call, data[9:])
+        elif data.startswith("logs_"):
+            show_bot_logs(call, data[5:])
+        elif data.startswith("restart_"):
+            restart_user_bot(call, data[8:])
+        elif data == "back_to_files":
+            show_user_files_callback(call)
+
         elif data == "admin_view_all_files":
-            show_all_user_files_for_admin(call)
+            show_all_user_bots_for_admin(call)
         elif data == "admin_top_referrers":
             show_top_referrers(call)
         elif data == "admin_stopall":
@@ -2200,955 +2044,480 @@ def handle_callback(call):
         elif data == "admin_logs":
             show_admin_logs(call)
         elif data == "admin_back":
-            class FakeMessage:
-                def __init__(self, call):
-                    self.chat = call.message.chat
-                    self.from_user = call.from_user
-            show_admin_panel(FakeMessage(call))
+            _fake_message(call, show_admin_panel)
             bot.answer_callback_query(call.id)
-        
         elif data.startswith("admin_user_"):
-            target_user = int(data[11:])
-            show_admin_user_files(call, target_user)
-        
-        elif data.startswith("admin_file_"):
-            parts = data.split("_", 2)
-            if len(parts) == 3:
-                target_user = int(parts[1])
-                file_name = parts[2]
-                show_admin_file_actions(call, target_user, file_name)
-        
+            show_admin_user_bots(call, int(data[11:]))
+        elif data.startswith("admin_bot_"):
+            show_admin_bot_actions(call, data[10:])
         elif data.startswith("admin_download_"):
-            parts = data.split("_", 2)
-            if len(parts) == 3:
-                target_user = int(parts[1])
-                file_name = parts[2]
-                download_user_file_as_admin(call, target_user, file_name)
-        
+            admin_download_bot(call, data[15:])
         elif data.startswith("admin_run_"):
-            parts = data.split("_", 2)
-            if len(parts) == 3:
-                target_user = int(parts[1])
-                file_name = parts[2]
-                run_user_script_as_admin(call, target_user, file_name)
-        
+            admin_run_bot(call, data[10:])
         elif data.startswith("admin_stop_"):
-            parts = data.split("_", 2)
-            if len(parts) == 3:
-                target_user = int(parts[1])
-                file_name = parts[2]
-                stop_user_script_as_admin(call, target_user, file_name)
-        
+            admin_stop_bot(call, data[11:])
         elif data.startswith("admin_delete_"):
-            parts = data.split("_", 2)
-            if len(parts) == 3:
-                target_user = int(parts[1])
-                file_name = parts[2]
-                delete_user_file_as_admin(call, target_user, file_name)
-        
+            admin_delete_bot(call, data[13:])
         elif data.startswith("admin_logs_"):
-            parts = data.split("_", 2)
-            if len(parts) == 3:
-                target_user = int(parts[1])
-                file_name = parts[2]
-                show_admin_script_logs(call, target_user, file_name)
-                
+            admin_show_bot_logs(call, data[11:])
+
     except Exception as e:
         logger.error(f"{BRAND_NAME} Callback error: {e}")
         bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:50]}")
 
+def _fake_message(call, func):
+    class FakeMessage:
+        def __init__(self, call):
+            self.chat = call.message.chat
+            self.from_user = call.from_user
+    func(FakeMessage(call))
+
 # ============================================
-# REFERRAL CALLBACK FUNCTIONS
+# REFERRAL CALLBACKS
 # ============================================
 
 def share_referral(call):
     user_id = call.from_user.id
     referral_link = get_user_referral_link(user_id)
-    
-    share_text = f"""
-🎯 <b>Join {BRAND_NAME} Bot Hosting!</b>
-
-🚀 Host your own Telegram bots!
-📤 Upload & run Python/Node.js scripts
-🎁 Get FREE points for referrals!
-
-<b>🔗 Click to join:</b>
-{referral_link}
-
-<b>💡 Benefits:</b>
-• 2 free bot slots
-• Earn 1 point per referral
-• 5 points = 1 extra bot slot
-• Unlimited potential! 🚀
-
-Join now! 🤖
-"""
-    
     markup = types.InlineKeyboardMarkup()
     markup.add(
-        types.InlineKeyboardButton("📤 Share via Telegram", switch_inline_query=share_text),
+        types.InlineKeyboardButton("📤 Share via Telegram", switch_inline_query=f"Join {BRAND_NAME}! {referral_link}"),
         types.InlineKeyboardButton("🔗 Copy Link", callback_data="copy_referral_link")
     )
     markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="refresh_points"))
-    
     bot.edit_message_text(
-        f"""
-📤 <b>Share Your Referral Link!</b>
-
-<b>🔗 Your Link:</b>
-<code>{referral_link}</code>
-
-Share with friends and earn points! 🎉
-
-💡 <b>How to share:</b>
-1. Copy the link above
-2. Send it to friends/groups
-3. When they join, you get 1 point!
-""",
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode='HTML',
-        reply_markup=markup
+        f"📤 <b>Share Your Referral Link!</b>\n\n<code>{referral_link}</code>\n\nShare with friends and earn points! 🎉",
+        call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup
     )
     bot.answer_callback_query(call.id)
 
 def copy_referral_link(call):
-    user_id = call.from_user.id
-    referral_link = get_user_referral_link(user_id)
-    bot.answer_callback_query(call.id, f"✅ Link copied: {referral_link}")
+    referral_link = get_user_referral_link(call.from_user.id)
+    bot.answer_callback_query(call.id, "✅ Link ready below")
     bot.send_message(call.message.chat.id, f"📋 <b>Your Referral Link:</b>\n<code>{referral_link}</code>", parse_mode='HTML')
 
 def show_referral_history(call):
     user_id = call.from_user.id
     ref_stats = get_referral_stats(user_id)
-    
+    markup = types.InlineKeyboardMarkup()
     if ref_stats['total'] == 0:
-        text = """
-📊 <b>No Referrals Yet</b>
-
-Start sharing your referral link to earn points!
-Each referral = 1 point ✨
-5 points = 1 extra bot slot 🚀
-"""
-        markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("📤 Share Now", callback_data="share_referral"))
         markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="refresh_points"))
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                              parse_mode='HTML', reply_markup=markup)
+        bot.edit_message_text("📊 <b>No Referrals Yet</b>\n\nStart sharing your referral link!",
+                              call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
         bot.answer_callback_query(call.id)
         return
-    
-    text = f"""
-╔══════════════════════════════════════╗
-║     📊 <b>REFERRAL HISTORY</b> 📊          ║
-╠══════════════════════════════════════╣
-║
-║  👥 <b>Total Referrals:</b> {ref_stats['total']}
-║  ⭐ <b>Total Points:</b> {ref_stats['points']}
-║
-║  <b>Recent Referrals:</b>
-"""
-    
+
+    text = f"📊 <b>REFERRAL HISTORY</b>\n\n👥 Total: {ref_stats['total']}\n⭐ Points: {ref_stats['points']}\n\n<b>Recent:</b>\n"
     for i, (referred_id, timestamp) in enumerate(ref_stats['recent'][:10], 1):
-        username = "Unknown"
-        try:
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute('SELECT username FROM active_users WHERE user_id = ?', (referred_id,))
-            result = c.fetchone()
-            if result:
-                username = result[0] or str(referred_id)
-            conn.close()
-        except:
-            pass
-        text += f"║  {i}. 👤 {username} ({referred_id})\n"
-        text += f"║     🕐 {timestamp[:16]}\n"
-    
-    text += """
-╚══════════════════════════════════════╝
-"""
-    
-    markup = types.InlineKeyboardMarkup()
+        username = _lookup_username(referred_id)
+        text += f"{i}. 👤 {username} ({referred_id}) — {timestamp[:16]}\n"
+
     markup.add(types.InlineKeyboardButton("📤 Share More", callback_data="share_referral"))
     markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="refresh_points"))
-    
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                          parse_mode='HTML', reply_markup=markup)
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
     bot.answer_callback_query(call.id)
 
 def refresh_points(call):
-    user_id = call.from_user.id
-    class FakeMessage:
-        def __init__(self, call):
-            self.chat = call.message.chat
-            self.from_user = call.from_user
-    show_my_points(FakeMessage(call))
+    _fake_message(call, show_my_points)
     bot.answer_callback_query(call.id, "🔄 Refreshed!")
 
 # ============================================
-# FILE ACTION CALLBACK FUNCTIONS
+# BOT ACTION CALLBACKS (owner)
 # ============================================
 
-def show_file_actions(call, file_name):
+def show_bot_actions(call, bot_id):
     user_id = call.from_user.id
-    is_running = is_bot_running(user_id, file_name)
-    file_type = "py"
-    for name, ftype in user_files.get(user_id, []):
-        if name == file_name:
-            file_type = ftype
-            break
-    type_icon = "🐍" if file_type == "py" else "🟨" if file_type == "js" else "📄"
+    b = find_bot_by_id(user_id, bot_id)
+    if not b:
+        bot.answer_callback_query(call.id, "❌ Bot not found!")
+        return
+    is_running = is_bot_running_check(bot_id)
+    type_icon = "🐍" if b['entry_type'] == 'py' else "🟨" if b['entry_type'] == 'js' else "📄"
     status = "🟢 Running" if is_running else "🔴 Stopped"
     text = f"""
 ╔══════════════════════════════════════╗
-║       📄 <b>{BRAND_NAME}: FILE</b> 📄         ║
+║       🤖 <b>{BRAND_NAME}: BOT</b> 🤖          ║
 ╠══════════════════════════════════════╣
 ║
-║  {type_icon} <b>Name:</b> <code>{file_name[:25]}</code>
-║  📁 <b>Type:</b> {file_type.upper()}
+║  {type_icon} <b>Name:</b> <code>{b['bot_name'][:25]}</code>
+║  🎯 <b>Entry:</b> <code>{(b['entry_file'] or 'None')[:25]}</code>
+║  📁 <b>Files:</b> {b['file_count']}
 ║  📊 <b>Status:</b> {status}
 ║
 ╚══════════════════════════════════════╝
 """
-    markup = get_file_actions_keyboard(file_name, is_running)
+    markup = get_bot_actions_keyboard(bot_id, is_running)
     try:
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                              parse_mode='HTML', reply_markup=markup)
-    except:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
+    except Exception:
         bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
     bot.answer_callback_query(call.id)
 
-def run_user_script(call, file_name):
+def run_user_bot(call, bot_id):
     user_id = call.from_user.id
-    user_folder = get_user_folder(user_id)
-    script_path = os.path.join(user_folder, file_name)
-    if not os.path.exists(script_path):
-        bot.answer_callback_query(call.id, "❌ File not found!")
+    b = find_bot_by_id(user_id, bot_id)
+    if not b:
+        bot.answer_callback_query(call.id, "❌ Bot not found!")
         return
-    if is_bot_running(user_id, file_name):
+    if is_bot_running_check(bot_id):
         bot.answer_callback_query(call.id, "⚠️ Already running!")
         return
     bot.answer_callback_query(call.id, "🚀 Starting...")
-    if file_name.endswith('.py'):
-        threading.Thread(target=run_script,
-                         args=(script_path, user_id, user_folder, file_name, call.message)).start()
-    elif file_name.endswith('.js'):
-        threading.Thread(target=run_js_script,
-                         args=(script_path, user_id, user_folder, file_name, call.message)).start()
-    else:
-        bot.send_message(call.message.chat.id, "❌ Unsupported type!")
+    threading.Thread(target=run_bot_instance, args=(b, call.message)).start()
 
-def stop_user_script(call, file_name):
+def stop_user_bot(call, bot_id):
     user_id = call.from_user.id
-    script_key = f"{user_id}_{file_name}"
-    if script_key not in bot_scripts:
-        bot.answer_callback_query(call.id, "❌ Script not running!")
+    if bot_id not in bot_scripts:
+        bot.answer_callback_query(call.id, "❌ Not running!")
         return
     bot.answer_callback_query(call.id, "🛑 Stopping...")
-    stop_text = f"""
-╔══════════════════════════════════════╗
-║       🛑 <b>{BRAND_NAME}: STOPPING</b> 🛑     ║
-╠══════════════════════════════════════╣
-║
-║  📄 <code>{file_name[:25]}</code>
-║  ⏳ Please wait...
-║
-╚══════════════════════════════════════╝
-"""
-    try:
-        bot.edit_message_text(stop_text, call.message.chat.id, call.message.message_id, parse_mode='HTML')
-    except:
-        pass
-    script_info = bot_scripts.get(script_key)
+    b = find_bot_by_id(user_id, bot_id)
+    script_info = bot_scripts.get(bot_id)
     if script_info:
         kill_process_tree(script_info)
-        cleanup_script(script_key)
+        cleanup_script(bot_id)
         time.sleep(1)
-        success_text = f"""
-╔══════════════════════════════════════╗
-║       ✅ <b>{BRAND_NAME}: STOPPED</b> ✅      ║
-╠══════════════════════════════════════╣
-║
-║  📄 <code>{file_name[:25]}</code>
-║  ✅ Successfully stopped!
-║
-╚══════════════════════════════════════╝
-"""
+        bot_name = b['bot_name'] if b else bot_id
+        success_text = f"✅ <b>Stopped!</b>\n🤖 <code>{bot_name[:25]}</code>"
         markup = types.InlineKeyboardMarkup()
         markup.add(
-            types.InlineKeyboardButton("▶️ Run Again", callback_data=f"run_{file_name}"),
+            types.InlineKeyboardButton("▶️ Run Again", callback_data=f"run_{bot_id}"),
             types.InlineKeyboardButton("🔙 Back", callback_data="back_to_files")
         )
         try:
-            bot.edit_message_text(success_text, call.message.chat.id, call.message.message_id,
-                                  parse_mode='HTML', reply_markup=markup)
-        except:
+            bot.edit_message_text(success_text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
+        except Exception:
             bot.send_message(call.message.chat.id, success_text, parse_mode='HTML', reply_markup=markup)
-        log_action(user_id, "SCRIPT_STOP", f"Stopped {file_name}")
+        log_action(user_id, "BOT_STOP", f"Stopped {bot_name}")
 
-def delete_user_file(call, file_name):
+def restart_user_bot(call, bot_id):
     user_id = call.from_user.id
-    if is_bot_running(user_id, file_name):
-        bot.answer_callback_query(call.id, "⚠️ Stop the script first!")
+    if bot_id in bot_scripts:
+        kill_process_tree(bot_scripts[bot_id])
+        cleanup_script(bot_id)
+        time.sleep(1)
+    run_user_bot(call, bot_id)
+
+def delete_user_bot_confirm(call, bot_id):
+    user_id = call.from_user.id
+    b = find_bot_by_id(user_id, bot_id)
+    if not b:
+        bot.answer_callback_query(call.id, "❌ Bot not found!")
         return
-    confirm_text = f"""
-╔══════════════════════════════════════╗
-║      ⚠️ <b>{BRAND_NAME}: DELETE?</b> ⚠️      ║
-╠══════════════════════════════════════╣
-║
-║  Are you sure?
-║  📄 <code>{file_name[:25]}</code>
-║
-║  ⚠️ This cannot be undone!
-║
-╚══════════════════════════════════════╝
-"""
+    if is_bot_running_check(bot_id):
+        bot.answer_callback_query(call.id, "⚠️ Stop the bot first!")
+        return
+    confirm_text = f"⚠️ <b>Delete '{b['bot_name'][:25]}'?</b>\n\nThis cannot be undone!"
     markup = types.InlineKeyboardMarkup()
     markup.add(
-        types.InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_{file_name}"),
-        types.InlineKeyboardButton("❌ No", callback_data=f"cancel_delete_{file_name}")
+        types.InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_{bot_id}"),
+        types.InlineKeyboardButton("❌ No", callback_data=f"cancel_delete_{bot_id}")
     )
     try:
-        bot.edit_message_text(confirm_text, call.message.chat.id, call.message.message_id,
-                              parse_mode='HTML', reply_markup=markup)
-    except:
+        bot.edit_message_text(confirm_text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
+    except Exception:
         pass
     bot.answer_callback_query(call.id)
 
-def confirm_delete_file(call, file_name):
+def confirm_delete_bot(call, bot_id):
     user_id = call.from_user.id
-    user_folder = get_user_folder(user_id)
-    file_path = os.path.join(user_folder, file_name)
+    b = find_bot_by_id(user_id, bot_id)
+    if not b:
+        bot.answer_callback_query(call.id, "❌ Bot not found!")
+        return
     try:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            if user_id in user_files:
-                user_files[user_id] = [(n, t) for n, t in user_files[user_id] if n != file_name]
-            remove_user_file_db(user_id, file_name)
-            time.sleep(1)
-            success_text = f"""
-╔══════════════════════════════════════╗
-║       ✅ <b>{BRAND_NAME}: DELETED</b> ✅       ║
-╠══════════════════════════════════════╣
-║
-║  📄 <code>{file_name[:25]}</code>
-║  ✅ Successfully deleted!
-║
-╚══════════════════════════════════════╝
-"""
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("📂 Back to Files", callback_data="back_to_files"))
-            try:
-                bot.edit_message_text(success_text, call.message.chat.id, call.message.message_id,
-                                      parse_mode='HTML', reply_markup=markup)
-            except:
-                bot.send_message(call.message.chat.id, success_text, parse_mode='HTML', reply_markup=markup)
-            bot.answer_callback_query(call.id, "✅ Deleted!")
+        shutil.rmtree(b['folder'], ignore_errors=True)
+        user_bots[user_id] = [x for x in user_bots.get(user_id, []) if x['bot_id'] != bot_id]
+        remove_hosted_bot_db(bot_id)
+        log_action(user_id, "BOT_DELETE", f"Deleted {b['bot_name']}")
+        success_text = f"✅ <b>Deleted!</b>\n🤖 <code>{b['bot_name'][:25]}</code>"
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("📂 Back to Bots", callback_data="back_to_files"))
+        try:
+            bot.edit_message_text(success_text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
+        except Exception:
+            bot.send_message(call.message.chat.id, success_text, parse_mode='HTML', reply_markup=markup)
+        bot.answer_callback_query(call.id, "✅ Deleted!")
     except Exception as e:
         bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:30]}")
 
-def download_user_file(call, file_name):
+def download_user_bot(call, bot_id):
     user_id = call.from_user.id
-    user_folder = get_user_folder(user_id)
-    file_path = os.path.join(user_folder, file_name)
-    if not os.path.exists(file_path):
-        bot.answer_callback_query(call.id, "❌ File not found!")
+    b = find_bot_by_id(user_id, bot_id)
+    if not b:
+        bot.answer_callback_query(call.id, "❌ Bot not found!")
         return
-    bot.answer_callback_query(call.id, "📥 Sending...")
-    try:
-        with open(file_path, 'rb') as f:
-            bot.send_document(call.message.chat.id, f, caption=f"📄 {file_name}")
-    except Exception as e:
-        bot.send_message(call.message.chat.id, f"❌ Error: {str(e)[:100]}")
+    bot.answer_callback_query(call.id, "📥 Preparing...")
+    _send_bot_as_file(call.message.chat.id, b)
 
-def show_script_logs(call, file_name):
-    user_id = call.from_user.id
-    script_key = f"{user_id}_{file_name}"
-    log_path = os.path.join(LOGS_DIR, f"{script_key}.log")
+def _send_bot_as_file(chat_id, b):
+    try:
+        files_in_folder = []
+        for root, dirs, files in os.walk(b['folder']):
+            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+            files_in_folder.extend(files)
+
+        if len(files_in_folder) == 1:
+            single_path = os.path.join(b['folder'], files_in_folder[0])
+            with open(single_path, 'rb') as f:
+                bot.send_document(chat_id, f, caption=f"📄 {b['bot_name']}")
+        else:
+            archive_base = os.path.join(TMP_DIR, f"dl_{b['bot_id']}")
+            archive_path = shutil.make_archive(archive_base, 'zip', b['folder'])
+            with open(archive_path, 'rb') as f:
+                bot.send_document(chat_id, f, caption=f"📦 {b['bot_name']}.zip ({b['file_count']} files)")
+            os.remove(archive_path)
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Download failed: {str(e)[:100]}")
+
+def show_bot_logs(call, bot_id):
+    log_path = os.path.join(LOGS_DIR, f"{bot_id}.log")
     if not os.path.exists(log_path):
-        bot.answer_callback_query(call.id, "📋 No logs")
+        bot.answer_callback_query(call.id, "📋 No logs yet")
         return
     try:
         with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-            logs = f.read()[-2000:]
-            if not logs.strip():
-                logs = "No output yet..."
-        log_text = f"""
-╔══════════════════════════════════════╗
-║       📋 <b>{BRAND_NAME}: LOGS</b> 📋         ║
-╠══════════════════════════════════════╣
-║ 📄 <code>{file_name[:25]}</code>
-╠══════════════════════════════════════╣
-<code>{logs[:1500]}</code>
-╚══════════════════════════════════════╝
-"""
+            logs = f.read()[-2000:] or "No output yet..."
+        log_text = f"📋 <b>{BRAND_NAME}: LOGS</b>\n\n<code>{logs[:1800]}</code>"
         markup = types.InlineKeyboardMarkup()
         markup.add(
-            types.InlineKeyboardButton("🔄 Refresh", callback_data=f"logs_{file_name}"),
-            types.InlineKeyboardButton("🔙 Back", callback_data=f"file_{file_name}")
+            types.InlineKeyboardButton("🔄 Refresh", callback_data=f"logs_{bot_id}"),
+            types.InlineKeyboardButton("🔙 Back", callback_data=f"bot_{bot_id}")
         )
         try:
-            bot.edit_message_text(log_text, call.message.chat.id, call.message.message_id,
-                                  parse_mode='HTML', reply_markup=markup)
-        except:
+            bot.edit_message_text(log_text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
+        except Exception:
             bot.answer_callback_query(call.id, "📋 Logs unchanged")
     except Exception as e:
         bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:30]}")
 
-def restart_user_script(call, file_name):
-    user_id = call.from_user.id
-    script_key = f"{user_id}_{file_name}"
-    if script_key in bot_scripts:
-        script_info = bot_scripts.get(script_key)
-        if script_info:
-            kill_process_tree(script_info)
-            cleanup_script(script_key)
-            time.sleep(1)
-    run_user_script(call, file_name)
-
 def show_user_files_callback(call):
-    class FakeMessage:
-        def __init__(self, call):
-            self.chat = call.message.chat
-            self.from_user = call.from_user
-    show_user_files(FakeMessage(call))
+    _fake_message(call, show_user_files)
     bot.answer_callback_query(call.id)
 
 # ============================================
-# RETRY FAILED & STOP ALL FUNCTIONS
+# ADMIN CALLBACKS
 # ============================================
 
-def retry_failed_scripts(call, target_user):
-    """Retry failed scripts"""
-    user_id = call.from_user.id
-    if user_id != target_user and user_id != OWNER_ID and user_id not in admin_ids:
-        bot.answer_callback_query(call.id, "❌ You can only retry your own scripts!")
-        return
-    
-    bot.answer_callback_query(call.id, "🔄 Retrying failed scripts...")
-    
-    user_folder = get_user_folder(target_user)
-    files = user_files.get(target_user, [])
-    
-    started = 0
-    failed = 0
-    
-    for file_name, file_type in files:
-        if file_type in ['py', 'js']:
-            if is_bot_running(target_user, file_name):
-                continue
-            
-            script_path = os.path.join(user_folder, file_name)
-            if os.path.exists(script_path):
-                try:
-                    if file_type == 'py':
-                        threading.Thread(
-                            target=run_script,
-                            args=(script_path, target_user, user_folder, file_name, call.message)
-                        ).start()
-                    else:
-                        threading.Thread(
-                            target=run_js_script,
-                            args=(script_path, target_user, user_folder, file_name, call.message)
-                        ).start()
-                    started += 1
-                    time.sleep(0.3)
-                except:
-                    failed += 1
-    
-    bot.send_message(call.message.chat.id, f"""
-✅ <b>Retry Complete!</b>
-🚀 <b>Started:</b> {started}
-❌ <b>Failed:</b> {failed}
-""", parse_mode='HTML')
-
-def stop_all_user_scripts(call, target_user):
-    """Stop all scripts of a user"""
-    user_id = call.from_user.id
-    if user_id != target_user and user_id != OWNER_ID and user_id not in admin_ids:
-        bot.answer_callback_query(call.id, "❌ You can only stop your own scripts!")
-        return
-    
-    bot.answer_callback_query(call.id, "🛑 Stopping all scripts...")
-    
-    stopped = 0
-    for script_key, info in list(bot_scripts.items()):
-        if info.get('user_id') == target_user:
-            try:
-                kill_process_tree(info)
-                cleanup_script(script_key)
-                stopped += 1
-            except:
-                pass
-    
-    bot.send_message(call.message.chat.id, f"""
-✅ <b>Stopped {stopped} scripts!</b>
-""", parse_mode='HTML')
-    
-    class FakeMessage:
-        def __init__(self, call):
-            self.chat = call.message.chat
-            self.from_user = call.from_user
-    show_user_files(FakeMessage(call))
-
-# ============================================
-# ADMIN CALLBACK FUNCTIONS
-# ============================================
-
-def show_all_user_files_for_admin(call):
-    user_id = call.from_user.id
-    if user_id != OWNER_ID and user_id not in admin_ids:
+def show_all_user_bots_for_admin(call):
+    if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
         bot.answer_callback_query(call.id, "❌ Admin only!")
         return
-    
-    if not user_files:
-        bot.edit_message_text(
-            "📂 <b>No files found!</b>\n\nNo user has uploaded any files yet.",
-            call.message.chat.id, call.message.message_id, parse_mode='HTML'
-        )
+    if not user_bots:
+        bot.edit_message_text("📂 <b>No bots hosted yet!</b>", call.message.chat.id, call.message.message_id, parse_mode='HTML')
         bot.answer_callback_query(call.id)
         return
-    
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    user_list = sorted(user_files.keys())
-    
-    for uid in user_list[:20]:
-        files_count = len(user_files[uid])
-        username = "Unknown"
-        try:
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute('SELECT username FROM active_users WHERE user_id = ?', (uid,))
-            result = c.fetchone()
-            if result:
-                username = result[0] or str(uid)
-            conn.close()
-        except:
-            username = f"User_{uid}"
-        
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for uid in sorted(user_bots.keys())[:25]:
+        count = len(user_bots[uid])
+        username = _lookup_username(uid)
         badge = "👑" if uid == OWNER_ID else "⭐" if uid in admin_ids else "👤"
-        markup.add(types.InlineKeyboardButton(
-            f"{badge} {username[:12]} ({files_count} files)",
-            callback_data=f"admin_user_{uid}"
-        ))
-    
+        markup.add(types.InlineKeyboardButton(f"{badge} {username[:15]} ({count} bots)", callback_data=f"admin_user_{uid}"))
     markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin_back"))
-    
-    text = f"""
-╔══════════════════════════════════════╗
-║    📂 <b>{BRAND_NAME}: ALL USER FILES</b> 📂  ║
-╠══════════════════════════════════════╣
-║
-║  Total Users: {len(user_list)}
-║  Total Files: {sum(len(files) for files in user_files.values())}
-║
-║  Click a user to view files:
-║
-╚══════════════════════════════════════╝
-"""
+
+    text = f"📂 <b>{BRAND_NAME}: ALL USER BOTS</b>\n\nUsers: {len(user_bots)}\nTotal Bots: {sum(len(b) for b in user_bots.values())}"
     try:
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                              parse_mode='HTML', reply_markup=markup)
-    except:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
+    except Exception:
         bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
     bot.answer_callback_query(call.id)
 
-def show_admin_user_files(call, target_user):
-    user_id = call.from_user.id
-    if user_id != OWNER_ID and user_id not in admin_ids:
+def show_admin_user_bots(call, target_user):
+    if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
         bot.answer_callback_query(call.id, "❌ Admin only!")
         return
-    
-    files = user_files.get(target_user, [])
-    if not files:
-        bot.answer_callback_query(call.id, "📂 No files!")
+    bots = user_bots.get(target_user, [])
+    if not bots:
+        bot.answer_callback_query(call.id, "📂 No bots!")
         return
-    
-    username = "Unknown"
-    try:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('SELECT username FROM active_users WHERE user_id = ?', (target_user,))
-        result = c.fetchone()
-        if result:
-            username = result[0] or str(target_user)
-        conn.close()
-    except:
-        username = f"User_{target_user}"
-    
-    text = f"""
-╔══════════════════════════════════════╗
-║    📂 <b>{BRAND_NAME}: USER FILES</b> 📂    ║
-╠══════════════════════════════════════╣
-║
-║  👤 <b>User:</b> {username}
-║  🆔 <b>ID:</b> {target_user}
-║  📁 <b>Files:</b> {len(files)}
-║
-║  <b>Select a file:</b>
-║
-╚══════════════════════════════════════╝
-"""
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    
-    for file_name, file_type in files[:20]:
-        is_running = is_bot_running(target_user, file_name)
+    username = _lookup_username(target_user)
+    text = f"📂 <b>{username}'s Bots</b> (ID: {target_user})\n\nSelect one:"
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for b in bots[:25]:
+        is_running = is_bot_running_check(b['bot_id'])
         status = "🟢" if is_running else "🔴"
-        type_icon = "🐍" if file_type == "py" else "🟨" if file_type == "js" else "📦"
-        markup.add(types.InlineKeyboardButton(
-            f"{status} {type_icon} {file_name[:20]}",
-            callback_data=f"admin_file_{target_user}_{file_name}"
-        ))
-    
+        type_icon = "🐍" if b['entry_type'] == 'py' else "🟨" if b['entry_type'] == 'js' else "📦"
+        markup.add(types.InlineKeyboardButton(f"{status} {type_icon} {b['bot_name'][:20]}", callback_data=f"admin_bot_{b['bot_id']}"))
     markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin_view_all_files"))
-    
     try:
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                              parse_mode='HTML', reply_markup=markup)
-    except:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
+    except Exception:
         bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
     bot.answer_callback_query(call.id)
 
-def show_admin_file_actions(call, target_user, file_name):
-    admin_id = call.from_user.id
-    if admin_id != OWNER_ID and admin_id not in admin_ids:
+def show_admin_bot_actions(call, bot_id):
+    if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
         bot.answer_callback_query(call.id, "❌ Admin only!")
         return
-    
-    is_running = is_bot_running(target_user, file_name)
-    file_type = "py"
-    for name, ftype in user_files.get(target_user, []):
-        if name == file_name:
-            file_type = ftype
-            break
-    
-    username = "Unknown"
-    try:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('SELECT username FROM active_users WHERE user_id = ?', (target_user,))
-        result = c.fetchone()
-        if result:
-            username = result[0] or str(target_user)
-        conn.close()
-    except:
-        username = f"User_{target_user}"
-    
-    type_icon = "🐍" if file_type == "py" else "🟨" if file_type == "js" else "📄"
+    owner_id, b = find_bot_anywhere(bot_id)
+    if not b:
+        bot.answer_callback_query(call.id, "❌ Bot not found!")
+        return
+    is_running = is_bot_running_check(bot_id)
     status = "🟢 Running" if is_running else "🔴 Stopped"
-    
     text = f"""
-╔══════════════════════════════════════╗
-║   👑 <b>{BRAND_NAME}: FILE MANAGEMENT</b> 👑    ║
-╠══════════════════════════════════════╣
-║
-║  👤 <b>User:</b> {username}
-║  🆔 <b>ID:</b> {target_user}
-║  📄 <b>File:</b> <code>{file_name[:25]}</code>
-║  📁 <b>Type:</b> {file_type.upper()}
-║  📊 <b>Status:</b> {status}
-║
-╚══════════════════════════════════════╝
+👑 <b>Bot Management</b>
+
+👤 Owner: {owner_id}
+🤖 Name: <code>{b['bot_name'][:25]}</code>
+🎯 Entry: <code>{(b['entry_file'] or 'None')[:25]}</code>
+📊 Status: {status}
 """
     markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(types.InlineKeyboardButton("📥 Download", callback_data=f"admin_download_{target_user}_{file_name}"))
-    
+    markup.add(types.InlineKeyboardButton("📥 Download", callback_data=f"admin_download_{bot_id}"))
     if is_running:
         markup.add(
-            types.InlineKeyboardButton("🛑 Stop", callback_data=f"admin_stop_{target_user}_{file_name}"),
-            types.InlineKeyboardButton("📋 Logs", callback_data=f"admin_logs_{target_user}_{file_name}")
-        )
-        markup.add(
-            types.InlineKeyboardButton("🔄 Restart", callback_data=f"admin_run_{target_user}_{file_name}")
+            types.InlineKeyboardButton("🛑 Stop", callback_data=f"admin_stop_{bot_id}"),
+            types.InlineKeyboardButton("📋 Logs", callback_data=f"admin_logs_{bot_id}")
         )
     else:
         markup.add(
-            types.InlineKeyboardButton("▶️ Run", callback_data=f"admin_run_{target_user}_{file_name}"),
-            types.InlineKeyboardButton("🗑️ Delete", callback_data=f"admin_delete_{target_user}_{file_name}")
+            types.InlineKeyboardButton("▶️ Run", callback_data=f"admin_run_{bot_id}"),
+            types.InlineKeyboardButton("🗑️ Delete", callback_data=f"admin_delete_{bot_id}")
         )
-    
-    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data=f"admin_user_{target_user}"))
-    
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data=f"admin_user_{owner_id}"))
     try:
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                              parse_mode='HTML', reply_markup=markup)
-    except:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
+    except Exception:
         bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
     bot.answer_callback_query(call.id)
 
-def download_user_file_as_admin(call, target_user, file_name):
-    admin_id = call.from_user.id
-    if admin_id != OWNER_ID and admin_id not in admin_ids:
+def admin_download_bot(call, bot_id):
+    if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
         bot.answer_callback_query(call.id, "❌ Admin only!")
         return
-    
-    user_folder = get_user_folder(target_user)
-    file_path = os.path.join(user_folder, file_name)
-    
-    if not os.path.exists(file_path):
-        bot.answer_callback_query(call.id, "❌ File not found!")
+    _, b = find_bot_anywhere(bot_id)
+    if not b:
+        bot.answer_callback_query(call.id, "❌ Bot not found!")
         return
-    
-    bot.answer_callback_query(call.id, "📥 Downloading...")
-    
-    try:
-        with open(file_path, 'rb') as f:
-            bot.send_document(
-                call.message.chat.id, 
-                f,
-                caption=f"""
-╔══════════════════════════════════════╗
-║      📥 <b>{BRAND_NAME}: FILE DOWNLOAD</b> 📥     ║
-╠══════════════════════════════════════╣
-║
-║  👤 <b>User:</b> {target_user}
-║  📄 <b>File:</b> <code>{file_name}</code>
-║  📦 <b>Size:</b> {format_size(os.path.getsize(file_path))}
-║  👑 <b>Downloaded by:</b> {admin_id}
-║
-╚══════════════════════════════════════╝
-""",
-                parse_mode='HTML'
-            )
-        log_action(admin_id, "ADMIN_DOWNLOAD", f"Downloaded {file_name} from user {target_user}")
-    except Exception as e:
-        bot.send_message(call.message.chat.id, f"❌ Download failed: {str(e)[:100]}")
+    bot.answer_callback_query(call.id, "📥 Preparing...")
+    _send_bot_as_file(call.message.chat.id, b)
+    log_action(call.from_user.id, "ADMIN_DOWNLOAD", f"Downloaded {b['bot_name']}")
 
-def run_user_script_as_admin(call, target_user, file_name):
-    admin_id = call.from_user.id
-    if admin_id != OWNER_ID and admin_id not in admin_ids:
+def admin_run_bot(call, bot_id):
+    if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
         bot.answer_callback_query(call.id, "❌ Admin only!")
         return
-    
-    user_folder = get_user_folder(target_user)
-    script_path = os.path.join(user_folder, file_name)
-    
-    if not os.path.exists(script_path):
-        bot.answer_callback_query(call.id, "❌ File not found!")
+    _, b = find_bot_anywhere(bot_id)
+    if not b:
+        bot.answer_callback_query(call.id, "❌ Bot not found!")
         return
-    
-    if is_bot_running(target_user, file_name):
+    if is_bot_running_check(bot_id):
         bot.answer_callback_query(call.id, "⚠️ Already running!")
         return
-    
-    bot.answer_callback_query(call.id, f"🚀 Running {file_name}...")
-    
-    bot.send_message(call.message.chat.id, f"""
-╔══════════════════════════════════════╗
-║      🚀 <b>{BRAND_NAME}: RUNNING SCRIPT</b> 🚀    ║
-╠══════════════════════════════════════╣
-║
-║  👤 User: {target_user}
-║  📄 File: <code>{file_name}</code>
-║  👑 Admin: {admin_id}
-║
-╚══════════════════════════════════════╝
-""", parse_mode='HTML')
-    
-    if file_name.endswith('.py'):
-        threading.Thread(target=run_script,
-                         args=(script_path, target_user, user_folder, file_name, call.message)).start()
-    elif file_name.endswith('.js'):
-        threading.Thread(target=run_js_script,
-                         args=(script_path, target_user, user_folder, file_name, call.message)).start()
+    bot.answer_callback_query(call.id, f"🚀 Running {b['bot_name']}...")
+    threading.Thread(target=run_bot_instance, args=(b, call.message)).start()
 
-def stop_user_script_as_admin(call, target_user, file_name):
-    admin_id = call.from_user.id
-    if admin_id != OWNER_ID and admin_id not in admin_ids:
+def admin_stop_bot(call, bot_id):
+    if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
         bot.answer_callback_query(call.id, "❌ Admin only!")
         return
-    
-    script_key = f"{target_user}_{file_name}"
-    if script_key not in bot_scripts:
+    if bot_id not in bot_scripts:
         bot.answer_callback_query(call.id, "❌ Not running!")
         return
-    
     bot.answer_callback_query(call.id, "🛑 Stopping...")
-    
-    bot.send_message(call.message.chat.id, f"""
-╔══════════════════════════════════════╗
-║      🛑 <b>{BRAND_NAME}: STOPPING SCRIPT</b> 🛑   ║
-╠══════════════════════════════════════╣
-║
-║  👤 User: {target_user}
-║  📄 File: <code>{file_name}</code>
-║  👑 Admin: {admin_id}
-║
-╚══════════════════════════════════════╝
-""", parse_mode='HTML')
-    
-    script_info = bot_scripts.get(script_key)
-    if script_info:
-        kill_process_tree(script_info)
-        cleanup_script(script_key)
-        time.sleep(1)
-        bot.send_message(call.message.chat.id, f"""
-✅ <b>Stopped!</b>
-📄 <code>{file_name}</code>
-👤 User: {target_user}
-""", parse_mode='HTML')
+    kill_process_tree(bot_scripts[bot_id])
+    cleanup_script(bot_id)
+    time.sleep(1)
+    bot.send_message(call.message.chat.id, "✅ Stopped!")
 
-def delete_user_file_as_admin(call, target_user, file_name):
-    admin_id = call.from_user.id
-    if admin_id != OWNER_ID and admin_id not in admin_ids:
+def admin_delete_bot(call, bot_id):
+    if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
         bot.answer_callback_query(call.id, "❌ Admin only!")
         return
-    
-    if is_bot_running(target_user, file_name):
+    owner_id, b = find_bot_anywhere(bot_id)
+    if not b:
+        bot.answer_callback_query(call.id, "❌ Bot not found!")
+        return
+    if is_bot_running_check(bot_id):
         bot.answer_callback_query(call.id, "⚠️ Stop first!")
         return
-    
-    user_folder = get_user_folder(target_user)
-    file_path = os.path.join(user_folder, file_name)
-    
     try:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            if target_user in user_files:
-                user_files[target_user] = [(n, t) for n, t in user_files[target_user] if n != file_name]
-            remove_user_file_db(target_user, file_name)
-            bot.answer_callback_query(call.id, "✅ Deleted!")
-            bot.send_message(call.message.chat.id, f"""
-✅ <b>File Deleted!</b>
-📄 <code>{file_name}</code>
-👤 User: {target_user}
-👑 Admin: {admin_id}
-""", parse_mode='HTML')
-            show_admin_user_files(call, target_user)
-        else:
-            bot.answer_callback_query(call.id, "❌ File not found!")
+        shutil.rmtree(b['folder'], ignore_errors=True)
+        user_bots[owner_id] = [x for x in user_bots.get(owner_id, []) if x['bot_id'] != bot_id]
+        remove_hosted_bot_db(bot_id)
+        bot.answer_callback_query(call.id, "✅ Deleted!")
+        bot.send_message(call.message.chat.id, f"✅ Deleted {b['bot_name']} (owner: {owner_id})")
+        show_admin_user_bots(call, owner_id)
     except Exception as e:
         bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:30]}")
 
-def show_admin_script_logs(call, target_user, file_name):
-    admin_id = call.from_user.id
-    if admin_id != OWNER_ID and admin_id not in admin_ids:
+def admin_show_bot_logs(call, bot_id):
+    if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
         bot.answer_callback_query(call.id, "❌ Admin only!")
         return
-    
-    script_key = f"{target_user}_{file_name}"
-    log_path = os.path.join(LOGS_DIR, f"{script_key}.log")
-    
+    log_path = os.path.join(LOGS_DIR, f"{bot_id}.log")
     if not os.path.exists(log_path):
         bot.answer_callback_query(call.id, "📋 No logs")
         return
-    
     try:
         with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-            logs = f.read()[-2000:]
-            if not logs.strip():
-                logs = "No output yet..."
-        
-        log_text = f"""
-╔══════════════════════════════════════╗
-║  👑 <b>{BRAND_NAME}: USER SCRIPT LOGS</b> 👑   ║
-╠══════════════════════════════════════╣
-║ 👤 <b>User:</b> {target_user}
-║ 📄 <b>File:</b> <code>{file_name[:25]}</code>
-╠══════════════════════════════════════╣
-<code>{logs[:1500]}</code>
-╚══════════════════════════════════════╝
-"""
+            logs = f.read()[-2000:] or "No output yet..."
+        log_text = f"👑 <b>Bot Logs</b>\n\n<code>{logs[:1800]}</code>"
         markup = types.InlineKeyboardMarkup()
         markup.add(
-            types.InlineKeyboardButton("🔄 Refresh", callback_data=f"admin_logs_{target_user}_{file_name}"),
-            types.InlineKeyboardButton("🔙 Back", callback_data=f"admin_file_{target_user}_{file_name}")
+            types.InlineKeyboardButton("🔄 Refresh", callback_data=f"admin_logs_{bot_id}"),
+            types.InlineKeyboardButton("🔙 Back", callback_data=f"admin_bot_{bot_id}")
         )
         try:
-            bot.edit_message_text(log_text, call.message.chat.id, call.message.message_id,
-                                  parse_mode='HTML', reply_markup=markup)
-        except:
+            bot.edit_message_text(log_text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
+        except Exception:
             bot.answer_callback_query(call.id, "📋 Logs unchanged")
     except Exception as e:
         bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:30]}")
 
 def show_top_referrers(call):
-    admin_id = call.from_user.id
-    if admin_id != OWNER_ID and admin_id not in admin_ids:
+    if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
         bot.answer_callback_query(call.id, "❌ Admin only!")
         return
-    
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute('''SELECT user_id, points, total_referrals 
-                     FROM user_points 
-                     ORDER BY points DESC 
-                     LIMIT 20''')
+        c.execute('SELECT user_id, points, total_referrals FROM user_points ORDER BY points DESC LIMIT 20')
         top_users = c.fetchall()
         conn.close()
-        
         if not top_users:
             bot.answer_callback_query(call.id, "📊 No data!")
             return
-        
-        text = f"""
-╔══════════════════════════════════════╗
-║     🏆 <b>{BRAND_NAME} TOP REFERRERS</b> 🏆           ║
-╠══════════════════════════════════════╣
-"""
-        
+        text = f"🏆 <b>{BRAND_NAME} TOP REFERRERS</b>\n\n"
         medals = ["🥇", "🥈", "🥉"]
         for i, (uid, points, refs) in enumerate(top_users, 1):
-            medal = medals[i-1] if i <= 3 else f"{i}."
-            
-            username = "Unknown"
-            try:
-                conn2 = get_db_connection()
-                c2 = conn2.cursor()
-                c2.execute('SELECT username FROM active_users WHERE user_id = ?', (uid,))
-                result = c2.fetchone()
-                if result:
-                    username = result[0] or str(uid)
-                conn2.close()
-            except:
-                pass
-            
-            text += f"║  {medal} {username[:15]:<15} | ⭐{points} | 👥{refs}\n"
-        
-        text += "╚══════════════════════════════════════╝"
-        
+            medal = medals[i - 1] if i <= 3 else f"{i}."
+            username = _lookup_username(uid)
+            text += f"{medal} {username[:15]} | ⭐{points} | 👥{refs}\n"
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin_back"))
-        
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                              parse_mode='HTML', reply_markup=markup)
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
         bot.answer_callback_query(call.id)
     except Exception as e:
         bot.answer_callback_query(call.id, f"❌ {str(e)[:30]}")
 
 def stop_all_bots(call):
-    user_id = call.from_user.id
-    if user_id != OWNER_ID and user_id not in admin_ids:
+    if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
         bot.answer_callback_query(call.id, "❌ Admin only!")
         return
     bot.answer_callback_query(call.id, f"🛑 Stopping all {BRAND_NAME} bots...")
     stopped = 0
-    for script_key in list(bot_scripts.keys()):
+    for bot_id in list(bot_scripts.keys()):
         try:
-            script_info = bot_scripts[script_key]
-            kill_process_tree(script_info)
-            cleanup_script(script_key)
+            kill_process_tree(bot_scripts[bot_id])
+            cleanup_script(bot_id)
             stopped += 1
-        except:
+        except Exception:
             pass
     bot.send_message(call.message.chat.id, f"✅ Stopped {stopped} bots!")
 
 def refresh_admin_panel(call):
-    user_id = call.from_user.id
-    if user_id != OWNER_ID and user_id not in admin_ids:
+    if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
         bot.answer_callback_query(call.id, "❌ Admin only!")
         return
-    class FakeMessage:
-        def __init__(self, call):
-            self.chat = call.message.chat
-            self.from_user = call.from_user
-    show_admin_panel(FakeMessage(call))
+    _fake_message(call, show_admin_panel)
     bot.answer_callback_query(call.id, "🔄 Refreshed!")
 
 def show_admin_logs(call):
-    user_id = call.from_user.id
-    if user_id != OWNER_ID and user_id not in admin_ids:
+    if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
         bot.answer_callback_query(call.id, "❌ Admin only!")
         return
     try:
@@ -3160,7 +2529,7 @@ def show_admin_logs(call):
         if logs:
             text = f"📋 <b>{BRAND_NAME}: RECENT LOGS</b>\n"
             for log in logs:
-                text += f"👤 {log[0]} | {log[1]}\n{log[2][:30]}...\n🕐 {log[3][:16]}\n"
+                text += f"👤 {log[0]} | {log[1]}\n{str(log[2])[:30]}...\n🕐 {log[3][:16]}\n"
         else:
             text = "📋 No logs."
         bot.send_message(call.message.chat.id, text[:4000], parse_mode='HTML')
@@ -3173,11 +2542,10 @@ def show_admin_logs(call):
 
 def cleanup_on_exit():
     logger.info(f"Cleaning up {BRAND_NAME}...")
-    for script_key in list(bot_scripts.keys()):
+    for bot_id in list(bot_scripts.keys()):
         try:
-            script_info = bot_scripts[script_key]
-            kill_process_tree(script_info)
-        except:
+            kill_process_tree(bot_scripts[bot_id])
+        except Exception:
             pass
     logger.info(f"{BRAND_NAME} Cleanup complete.")
 
@@ -3190,16 +2558,15 @@ atexit.register(cleanup_on_exit)
 def main():
     logger.info("=" * 50)
     logger.info(f"🤖 Starting {BRAND_NAME} {BRAND_EMOJI} Bot...")
-    
-    # Initialize database
+
     init_db()
     load_data()
-    
+
     logger.info(f"📁 Base Dir: {BASE_DIR}")
     logger.info(f"📁 Upload Dir: {UPLOAD_BOTS_DIR}")
     logger.info(f"💾 Database: {'Turso' if TURSO_URL and TURSO_TOKEN else 'Local SQLite'}")
     logger.info("=" * 50)
-    
+
     keep_alive()
     while True:
         try:
