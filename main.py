@@ -1422,6 +1422,11 @@ def process_broadcast(message):
     except Exception:
         bot.send_message(message.chat.id, result_text, parse_mode='HTML')
 
+@bot.message_handler(commands=['subscriptions', 'subs'])
+@safe_command
+def subscriptions_view_command(message):
+    show_subscriptions(message)
+
 @bot.message_handler(commands=['subscribe'])
 @safe_command
 def subscribe_command(message):
@@ -1595,6 +1600,11 @@ def settings_command(message):
 # TEXT MESSAGE HANDLERS
 # ============================================
 
+def _normalize_button_text(text):
+    """Strips emoji/punctuation and lowercases, so 'Subscriptions' matches '💳 Subscriptions'
+    even if a user types the plain word instead of tapping the actual keyboard button."""
+    return re.sub(r'[^a-z0-9]+', '', text.lower())
+
 @bot.message_handler(content_types=['text'])
 @safe_command
 def handle_text(message):
@@ -1606,34 +1616,40 @@ def handle_text(message):
         bot.reply_to(message, "🔒 Bot is locked!")
         return
 
-    if text == "📢 Updates Channel":
+    norm = _normalize_button_text(text)
+
+    if text == "📢 Updates Channel" or norm == "updateschannel":
         bot.send_message(message.chat.id, f"📢 Join our {BRAND_NAME} updates:\n{UPDATE_CHANNEL}")
-    elif text == "📤 Upload File":
+    elif text == "📤 Upload File" or norm == "uploadfile":
         handle_upload_request(message)
-    elif text == "📂 Check Files":
+    elif text == "📂 Check Files" or norm == "checkfiles":
         show_user_files(message)
-    elif text == "🟢 Running Bots" or text == "🟢 My Running Bots":
+    elif text in ("🟢 Running Bots", "🟢 My Running Bots") or norm in ("runningbots", "myrunningbots"):
         running_command(message)
-    elif text == "⚡ Bot Speed":
+    elif text == "⚡ Bot Speed" or norm == "botspeed":
         speed_command(message)
-    elif text == "📊 Statistics" or text == "📊 My Stats":
+    elif text in ("📊 Statistics", "📊 My Stats") or norm in ("statistics", "mystats"):
         stats_command(message)
-    elif text == "⭐ My Points":
+    elif text == "⭐ My Points" or norm == "mypoints":
         show_my_points(message)
-    elif text == "🎯 Referral System":
+    elif text == "🎯 Referral System" or norm == "referralsystem":
         show_referral_system(message)
-    elif text == "💳 Subscriptions":
+    elif text == "💳 Subscriptions" or norm in ("subscriptions", "subscription", "subs"):
         show_subscriptions(message)
-    elif text == "📢 Broadcast":
+    elif text == "📢 Broadcast" or norm == "broadcast":
         broadcast_command(message)
-    elif text == "🔒 Lock Bot":
+    elif text == "🔒 Lock Bot" or norm == "lockbot":
         lock_command(message)
-    elif text == "👑 Admin Panel":
+    elif text == "👑 Admin Panel" or norm == "adminpanel":
         show_admin_panel(message)
-    elif text == "🖼️ Change Banner":
+    elif text == "🖼️ Change Banner" or norm == "changebanner":
         set_banner_command(message)
-    elif text == "📞 Contact Owner":
+    elif text == "📞 Contact Owner" or norm == "contactowner":
         bot.send_message(message.chat.id, f"📞 Contact: {YOUR_USERNAME}")
+    elif text.startswith('/'):
+        bot.reply_to(message, "❓ Unknown command. Send /help to see everything I understand.")
+    else:
+        bot.reply_to(message, "❓ I didn't recognize that. Use the buttons below, or send /help.")
 
 def handle_upload_request(message):
     user_id = message.from_user.id
