@@ -17,6 +17,7 @@ import sys
 import atexit
 import requests
 import uuid
+from functools import wraps
 from flask import Flask
 from threading import Thread
 
@@ -1087,7 +1088,24 @@ def get_bot_actions_keyboard(bot_id, is_running=False):
 # COMMAND HANDLERS
 # ============================================
 
+def safe_command(func):
+    """Guarantees a visible reply even if a handler throws unexpectedly.
+    Without this, pyTelegramBotAPI just swallows the exception and the user
+    sees literally nothing — which is exactly the 'no response' bug class."""
+    @wraps(func)
+    def wrapper(message, *args, **kwargs):
+        try:
+            return func(message, *args, **kwargs)
+        except Exception as e:
+            logger.error(f"{BRAND_NAME} Handler '{func.__name__}' crashed: {e}")
+            try:
+                bot.reply_to(message, f"❌ <b>Something went wrong running this command.</b>\n<code>{str(e)[:300]}</code>", parse_mode='HTML')
+            except Exception:
+                pass
+    return wrapper
+
 @bot.message_handler(commands=['start'])
+@safe_command
 def start_command(message):
     user_id = message.from_user.id
     username = message.from_user.username or "Unknown"
@@ -1177,6 +1195,7 @@ Start by uploading your first bot! 🚀
         )
 
 @bot.message_handler(commands=['help'])
+@safe_command
 def help_command(message):
     help_text = f"""
 ╔══════════════════════════════════════╗
@@ -1213,6 +1232,7 @@ def help_command(message):
     bot.send_message(message.chat.id, help_text, parse_mode='HTML')
 
 @bot.message_handler(commands=['stats'])
+@safe_command
 def stats_command(message):
     msg = send_spinner_animation(message.chat.id, f"Gathering {BRAND_NAME} stats...", duration=2)
     stats_text = create_system_stats_message()
@@ -1222,6 +1242,7 @@ def stats_command(message):
         bot.send_message(message.chat.id, stats_text, parse_mode='HTML')
 
 @bot.message_handler(commands=['speed'])
+@safe_command
 def speed_command(message):
     msg = send_spinner_animation(message.chat.id, f"Testing {BRAND_NAME} speed...", duration=2)
     start_time = time.time()
@@ -1248,6 +1269,7 @@ def speed_command(message):
         bot.send_message(message.chat.id, speed_text, parse_mode='HTML')
 
 @bot.message_handler(commands=['running', 'files'])
+@safe_command
 def running_or_files_command(message):
     if message.text.startswith('/files'):
         show_user_files(message)
@@ -1299,18 +1321,22 @@ def running_command(message):
         bot.send_message(message.chat.id, text, parse_mode='HTML')
 
 @bot.message_handler(commands=['points'])
+@safe_command
 def points_command(message):
     show_my_points(message)
 
 @bot.message_handler(commands=['referral'])
+@safe_command
 def referral_command(message):
     show_referral_system(message)
 
 @bot.message_handler(commands=['referrals'])
+@safe_command
 def referrals_command(message):
     show_referral_history_for_command(message, message.from_user.id)
 
 @bot.message_handler(commands=['lock'])
+@safe_command
 def lock_command(message):
     global bot_locked
     user_id = message.from_user.id
@@ -1333,6 +1359,7 @@ def lock_command(message):
     send_animated_message(message.chat.id, lock_text, "terminal", duration=1)
 
 @bot.message_handler(commands=['broadcast'])
+@safe_command
 def broadcast_command(message):
     user_id = message.from_user.id
     if user_id != OWNER_ID and user_id not in admin_ids:
@@ -1341,10 +1368,14 @@ def broadcast_command(message):
     msg = bot.reply_to(message, "📢 Send the message you want to broadcast:")
     bot.register_next_step_handler(msg, process_broadcast)
 
+@safe_command
 def process_broadcast(message):
     broadcast_text = message.text
     if not broadcast_text:
         bot.reply_to(message, "❌ Please send a text message!")
+        return
+    if broadcast_text.startswith('/'):
+        bot.reply_to(message, "⚠️ That looked like a command, not a broadcast message — broadcast cancelled so it doesn't get sent to everyone. Run /broadcast again if you actually want to broadcast something.")
         return
     progress_msg = bot.send_message(message.chat.id, f"📢 Starting {BRAND_NAME} broadcast...")
     success = 0
@@ -1392,10 +1423,11 @@ def process_broadcast(message):
         bot.send_message(message.chat.id, result_text, parse_mode='HTML')
 
 @bot.message_handler(commands=['subscribe'])
+@safe_command
 def subscribe_command(message):
     user_id = message.from_user.id
     if user_id != OWNER_ID and user_id not in admin_ids:
-        bot.reply_to(message, "❌ You don't have permission!")
+        bot.reply_to(message, f"❌ You don't have permission! (Your ID: <code>{user_id}</code> is not recognized as owner/admin — check OWNER_ID/ADMIN_ID env vars on Railway)", parse_mode='HTML')
         return
     parts = message.text.split()
     if len(parts) < 3:
@@ -1428,6 +1460,7 @@ def subscribe_command(message):
         pass
 
 @bot.message_handler(commands=['addpoints'])
+@safe_command
 def add_points_command(message):
     user_id = message.from_user.id
     if user_id != OWNER_ID and user_id not in admin_ids:
@@ -1470,6 +1503,7 @@ Keep going! Share your referral link for more! 🚀
         bot.reply_to(message, "❌ Failed to add points!")
 
 @bot.message_handler(commands=['setbanner'])
+@safe_command
 def set_banner_command(message):
     user_id = message.from_user.id
     if user_id != OWNER_ID and user_id not in admin_ids:
@@ -1513,6 +1547,7 @@ def set_banner_command(message):
     log_action(user_id, "BANNER_CHANGE", f"Changed banner to {START_IMAGE_URL}")
 
 @bot.message_handler(commands=['setdesc'])
+@safe_command
 def set_description_command(message):
     user_id = message.from_user.id
     if user_id != OWNER_ID and user_id not in admin_ids:
@@ -1538,6 +1573,7 @@ def set_description_command(message):
     log_action(user_id, "DESC_CHANGE", "Changed description")
 
 @bot.message_handler(commands=['settings'])
+@safe_command
 def settings_command(message):
     user_id = message.from_user.id
     if user_id != OWNER_ID and user_id not in admin_ids:
@@ -1560,6 +1596,7 @@ def settings_command(message):
 # ============================================
 
 @bot.message_handler(content_types=['text'])
+@safe_command
 def handle_text(message):
     user_id = message.from_user.id
     text = message.text
@@ -1687,7 +1724,7 @@ def show_user_files(message):
 def show_subscriptions(message):
     user_id = message.from_user.id
     if user_id != OWNER_ID and user_id not in admin_ids:
-        bot.reply_to(message, "❌ Admin only!")
+        bot.reply_to(message, f"❌ Admin only! (Your ID: <code>{user_id}</code>)", parse_mode='HTML')
         return
     active_subs = {uid: data for uid, data in user_subscriptions.items()
                    if data['expiry'] > datetime.now()}
@@ -1900,6 +1937,7 @@ def _lookup_username(uid):
 # ============================================
 
 @bot.message_handler(content_types=['document'])
+@safe_command
 def handle_document(message):
     user_id = message.from_user.id
 
