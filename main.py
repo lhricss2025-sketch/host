@@ -17,9 +17,18 @@ import sys
 import atexit
 import requests
 import uuid
+import html
 from functools import wraps
 from flask import Flask
 from threading import Thread
+
+
+def esc(value):
+    """HTML-escapes dynamic content before it goes into an HTML-parsed Telegram message.
+    Without this, any '<', '>', or '&' in a filename, error message, program log,
+    or even a user's Telegram display name breaks Telegram's HTML parser and the
+    whole message silently fails to send."""
+    return html.escape(str(value), quote=False)
 
 # ============================================
 # TURSO DATABASE SETUP
@@ -264,7 +273,7 @@ def save_hosted_bot_db(bot_id, user_id, bot_name, folder_name, entry_file, entry
         (bot_id, user_id, bot_name, folder_name, entry_file, entry_type, file_count, datetime.now().isoformat()))
         conn.commit()
         conn.close()
-        log_action(user_id, "BOT_UPLOAD", f"Uploaded {bot_name}")
+        log_action(user_id, "BOT_UPLOAD", f"Uploaded {esc(bot_name)}")
     except Exception as e:
         logger.error(f"{BRAND_NAME} Error saving hosted bot: {e}")
 
@@ -434,7 +443,7 @@ Keep sharing your referral link! 🚀
 
     except Exception as e:
         logger.error(f"{BRAND_NAME} Error processing referral: {e}")
-        return False, f"❌ Error: {str(e)[:50]}"
+        return False, f"❌ Error: {esc(str(e)[:50])}"
 
 def get_referral_stats(user_id):
     try:
@@ -776,7 +785,8 @@ def auto_install_bulk_dependencies(folder, message_obj=None):
         try:
             result = subprocess.run(
                 [sys.executable, '-m', 'pip', 'install', '-r', req_path, '--disable-pip-version-check', '--no-input'],
-                capture_output=True, text=True, timeout=240, encoding='utf-8', errors='ignore'
+                capture_output=True, text=True, timeout=240, encoding='utf-8', errors='ignore',
+                env=get_sandboxed_env()
             )
             if message_obj:
                 if result.returncode == 0:
@@ -785,7 +795,7 @@ def auto_install_bulk_dependencies(folder, message_obj=None):
                     tail = (result.stderr or result.stdout or "")[-500:]
                     bot.send_message(message_obj.chat.id,
                                      f"⚠️ <b>Some packages in requirements.txt failed to install</b> — will still try to run, "
-                                     f"and auto-install anything still missing on crash.\n<code>{tail}</code>",
+                                     f"and auto-install anything still missing on crash.\n<code>{esc(tail)}</code>",
                                      parse_mode='HTML')
         except subprocess.TimeoutExpired:
             logger.error(f"{BRAND_NAME} requirements.txt install timed out for {folder}")
@@ -794,7 +804,7 @@ def auto_install_bulk_dependencies(folder, message_obj=None):
         except Exception as e:
             logger.error(f"{BRAND_NAME} requirements.txt install error: {e}")
             if message_obj:
-                bot.send_message(message_obj.chat.id, f"⚠️ requirements.txt install error: {str(e)[:200]}", parse_mode='HTML')
+                bot.send_message(message_obj.chat.id, f"⚠️ requirements.txt install error: {esc(str(e)[:200])}", parse_mode='HTML')
 
     pkg_path = os.path.join(folder, 'package.json')
     if os.path.exists(pkg_path):
@@ -803,7 +813,8 @@ def auto_install_bulk_dependencies(folder, message_obj=None):
         try:
             result = subprocess.run(
                 ['npm', 'install', '--no-audit', '--no-fund'],
-                cwd=folder, capture_output=True, text=True, timeout=240, encoding='utf-8', errors='ignore'
+                cwd=folder, capture_output=True, text=True, timeout=240, encoding='utf-8', errors='ignore',
+                env=get_sandboxed_env()
             )
             if message_obj:
                 if result.returncode == 0:
@@ -811,7 +822,7 @@ def auto_install_bulk_dependencies(folder, message_obj=None):
                 else:
                     tail = (result.stderr or result.stdout or "")[-500:]
                     bot.send_message(message_obj.chat.id,
-                                     f"⚠️ <b>npm install had errors</b> — will still try to run.\n<code>{tail}</code>",
+                                     f"⚠️ <b>npm install had errors</b> — will still try to run.\n<code>{esc(tail)}</code>",
                                      parse_mode='HTML')
         except subprocess.TimeoutExpired:
             logger.error(f"{BRAND_NAME} npm install timed out for {folder}")
@@ -823,7 +834,7 @@ def auto_install_bulk_dependencies(folder, message_obj=None):
         except Exception as e:
             logger.error(f"{BRAND_NAME} npm install error: {e}")
             if message_obj:
-                bot.send_message(message_obj.chat.id, f"⚠️ npm install error: {str(e)[:200]}", parse_mode='HTML')
+                bot.send_message(message_obj.chat.id, f"⚠️ npm install error: {esc(str(e)[:200])}", parse_mode='HTML')
 
 def attempt_install_pip(module_name, message):
     package_name = TELEGRAM_MODULES.get(module_name.lower(), module_name)
@@ -833,21 +844,21 @@ def attempt_install_pip(module_name, message):
         msg = send_spinner_animation(message.chat.id, f"Installing {package_name}...", duration=2)
         command = [sys.executable, '-m', 'pip', 'install', package_name, '--disable-pip-version-check', '--no-input']
         result = subprocess.run(command, capture_output=True, text=True, check=False,
-                                encoding='utf-8', errors='ignore', timeout=150)
+                                encoding='utf-8', errors='ignore', timeout=150, env=get_sandboxed_env())
         if result.returncode == 0:
             try:
                 bot.edit_message_text(
-                    f"✅ <b>Package Installed!</b>\n📦 <code>{package_name}</code> installed successfully!",
+                    f"✅ <b>Package Installed!</b>\n📦 <code>{esc(package_name)}</code> installed successfully!",
                     message.chat.id, msg.message_id, parse_mode='HTML'
                 )
             except Exception:
-                bot.send_message(message.chat.id, f"✅ Package {package_name} installed!", parse_mode='HTML')
+                bot.send_message(message.chat.id, f"✅ Package {esc(package_name)} installed!", parse_mode='HTML')
             return True
         else:
             error_msg = result.stderr[:500] if result.stderr else result.stdout[:500]
             try:
                 bot.edit_message_text(
-                    f"❌ <b>Installation Failed</b>\n<code>{error_msg}</code>",
+                    f"❌ <b>Installation Failed</b>\n<code>{esc(error_msg)}</code>",
                     message.chat.id, msg.message_id, parse_mode='HTML'
                 )
             except Exception:
@@ -861,11 +872,11 @@ def attempt_install_npm(module_name, folder, message):
         msg = send_spinner_animation(message.chat.id, f"Installing npm: {module_name}...", duration=2)
         command = ['npm', 'install', module_name, '--no-audit', '--no-fund']
         result = subprocess.run(command, capture_output=True, text=True, check=False,
-                                cwd=folder, encoding='utf-8', errors='ignore', timeout=150)
+                                cwd=folder, encoding='utf-8', errors='ignore', timeout=150, env=get_sandboxed_env())
         if result.returncode == 0:
             try:
                 bot.edit_message_text(
-                    f"✅ <b>NPM Package Installed!</b>\n📦 <code>{module_name}</code>",
+                    f"✅ <b>NPM Package Installed!</b>\n📦 <code>{esc(module_name)}</code>",
                     message.chat.id, msg.message_id, parse_mode='HTML'
                 )
             except Exception:
@@ -882,6 +893,17 @@ def attempt_install_npm(module_name, folder, message):
 # SCRIPT RUNNING (unified for py + js, keyed by bot_id)
 # ============================================
 
+def get_sandboxed_env():
+    """Environment for hosted (untrusted) bot subprocesses. Strips this hosting bot's own
+    secrets (BOT_TOKEN, OWNER_ID, admin config, DB credentials) so an uploaded bot can never
+    accidentally (or deliberately) read them and start polling with THIS bot's own token —
+    which is exactly what causes commands/admin access to appear to 'shift' between bots."""
+    env = os.environ.copy()
+    for key in ('BOT_TOKEN', 'OWNER_ID', 'ADMIN_ID', 'USERNAME', 'CHANNEL',
+                'TURSO_URL', 'TURSO_TOKEN', 'PORT'):
+        env.pop(key, None)
+    return env
+
 def run_bot_instance(bot_entry, message_obj, attempt=1, admin_id=None):
     """
     bot_entry: dict with bot_id, folder, entry_file, entry_type, bot_name, user_id
@@ -896,31 +918,31 @@ def run_bot_instance(bot_entry, message_obj, attempt=1, admin_id=None):
     owner_id = bot_entry['user_id']
 
     if attempt > max_attempts:
-        bot.send_message(message_obj.chat.id, f"❌ Failed to run '{bot_name}' after {max_attempts} attempts — check logs for the root cause.")
+        bot.send_message(message_obj.chat.id, f"❌ Failed to run '{esc(bot_name)}' after {max_attempts} attempts — check logs for the root cause.")
         return
 
     if not entry_type or not entry_file:
-        bot.send_message(message_obj.chat.id, f"⚠️ <b>{bot_name}</b> has no runnable .py or .js entry file — stored, but nothing to execute.", parse_mode='HTML')
+        bot.send_message(message_obj.chat.id, f"⚠️ <b>{esc(bot_name)}</b> has no runnable .py or .js entry file — stored, but nothing to execute.", parse_mode='HTML')
         return
 
     script_path = os.path.join(folder, entry_file)
     if not os.path.exists(script_path):
-        bot.send_message(message_obj.chat.id, f"❌ Entry file '{entry_file}' not found!")
+        bot.send_message(message_obj.chat.id, f"❌ Entry file '{esc(entry_file)}' not found!")
         return
 
     if entry_type == 'py':
         check_result = subprocess.run(
             [sys.executable, '-m', 'py_compile', script_path],
-            capture_output=True, text=True, timeout=15
+            capture_output=True, text=True, timeout=15, env=get_sandboxed_env()
         )
         if check_result.returncode != 0:
             bot.send_message(message_obj.chat.id,
-                             f"⚠️ <b>Syntax Error in {bot_name}</b>\n<code>{check_result.stderr[:600]}</code>",
+                             f"⚠️ <b>Syntax Error in {esc(bot_name)}</b>\n<code>{esc(check_result.stderr[:600])}</code>",
                              parse_mode='HTML')
             return
     elif entry_type == 'js' and not NODE_AVAILABLE:
         bot.send_message(message_obj.chat.id,
-                         f"❌ <b>{bot_name}</b> needs Node.js, but this host has none installed. "
+                         f"❌ <b>{esc(bot_name)}</b> needs Node.js, but this host has none installed. "
                          f"On Railway, add a nixpacks.toml with the nodejs package (included in the deployment files).",
                          parse_mode='HTML')
         return
@@ -929,8 +951,8 @@ def run_bot_instance(bot_entry, message_obj, attempt=1, admin_id=None):
 ╔══════════════════════════════════════╗
 ║      🚀 <b>{BRAND_NAME}: STARTING BOT</b> 🚀  ║
 ╠══════════════════════════════════════╣
-║ 🤖 Bot: <code>{bot_name[:25]}</code>
-║ 📄 Entry: <code>{entry_file[:25]}</code>
+║ 🤖 Bot: <code>{esc(bot_name[:25])}</code>
+║ 📄 Entry: <code>{esc(entry_file[:25])}</code>
 ║ 🔄 Attempt: {attempt}/{max_attempts}
 ╚══════════════════════════════════════╝
 """
@@ -948,7 +970,8 @@ def run_bot_instance(bot_entry, message_obj, attempt=1, admin_id=None):
             stderr=subprocess.STDOUT,
             text=True,
             encoding='utf-8',
-            errors='ignore'
+            errors='ignore',
+            env=get_sandboxed_env()
         )
     except FileNotFoundError:
         log_file.close()
@@ -973,7 +996,7 @@ def run_bot_instance(bot_entry, message_obj, attempt=1, admin_id=None):
 ╔══════════════════════════════════════╗
 ║     ✅ <b>{BRAND_NAME}: BOT RUNNING</b> ✅    ║
 ╠══════════════════════════════════════╣
-║ 🤖 <b>Bot:</b> <code>{bot_name[:25]}</code>
+║ 🤖 <b>Bot:</b> <code>{esc(bot_name[:25])}</code>
 ║ 🆔 <b>PID:</b> {process.pid}
 ║ ⏱️ <b>Started:</b> {datetime.now().strftime('%H:%M:%S')}
 ╚══════════════════════════════════════╝
@@ -982,7 +1005,7 @@ def run_bot_instance(bot_entry, message_obj, attempt=1, admin_id=None):
             bot.edit_message_text(success_msg, message_obj.chat.id, msg.message_id, parse_mode='HTML')
         except Exception:
             bot.send_message(message_obj.chat.id, success_msg, parse_mode='HTML')
-        log_action(owner_id, "BOT_START", f"Started {bot_name} (PID: {process.pid})")
+        log_action(owner_id, "BOT_START", f"Started {esc(bot_name)} (PID: {process.pid})")
         return
 
     # Process died almost immediately — read the tail of the log and try to self-heal
@@ -1013,10 +1036,10 @@ def run_bot_instance(bot_entry, message_obj, attempt=1, admin_id=None):
 ╔══════════════════════════════════════╗
 ║     ❌ <b>{BRAND_NAME}: BOT FAILED</b> ❌      ║
 ╠══════════════════════════════════════╣
-║ 🤖 <b>Bot:</b> <code>{bot_name[:25]}</code>
+║ 🤖 <b>Bot:</b> <code>{esc(bot_name[:25])}</code>
 ║ ❗ <b>Exit Code:</b> {process.returncode}
 ╠══════════════════════════════════════╣
-<code>{error_output[:500]}</code>
+<code>{esc(error_output[:500])}</code>
 ╚══════════════════════════════════════╝
 """
     try:
@@ -1036,7 +1059,7 @@ def run_bot_instance_safe(bot_entry, message_obj, attempt=1, admin_id=None):
             bot.send_message(
                 message_obj.chat.id,
                 f"❌ <b>Unexpected error while starting</b> <code>{bot_entry.get('bot_name', 'bot')}</code>:\n"
-                f"<code>{str(e)[:300]}</code>",
+                f"<code>{esc(str(e)[:300])}</code>",
                 parse_mode='HTML'
             )
         except Exception:
@@ -1099,7 +1122,7 @@ def safe_command(func):
         except Exception as e:
             logger.error(f"{BRAND_NAME} Handler '{func.__name__}' crashed: {e}")
             try:
-                bot.reply_to(message, f"❌ <b>Something went wrong running this command.</b>\n<code>{str(e)[:300]}</code>", parse_mode='HTML')
+                bot.reply_to(message, f"❌ <b>Something went wrong running this command.</b>\n<code>{esc(str(e)[:300])}</code>", parse_mode='HTML')
             except Exception:
                 pass
     return wrapper
@@ -1151,7 +1174,7 @@ Start by uploading your first bot! 🚀
     referral_link = get_user_referral_link(user_id)
 
     status_text = f"""
-👋 <b>Welcome, {message.from_user.first_name}</b>!
+👋 <b>Welcome, {esc(message.from_user.first_name)}</b>!
 
 <b>📌 Your Status:</b>
 🤖 <b>Bots:</b> {current_bots}/{max_bots if max_bots != float('inf') else '∞'}
@@ -1351,7 +1374,7 @@ def lock_command(message):
 ╠══════════════════════════════════════╣
 ║
 ║  Status: {status}
-║  By: {message.from_user.first_name}
+║  By: {esc(message.from_user.first_name)}
 ║  Time: {datetime.now().strftime('%H:%M:%S')}
 ║
 ╚══════════════════════════════════════╝
@@ -1388,7 +1411,7 @@ def process_broadcast(message):
 ║      📢 <b>{BRAND_NAME} {BRAND_EMOJI} BROADCAST</b> 📢    ║
 ╠══════════════════════════════════════╣
 ║
-{broadcast_text}
+{esc(broadcast_text)}
 ║
 ╚══════════════════════════════════════╝
 """
@@ -1436,7 +1459,7 @@ def subscribe_command(message):
         return
     parts = message.text.split()
     if len(parts) < 3:
-        bot.reply_to(message, "Usage: /subscribe <user_id> <days>")
+        bot.reply_to(message, "Usage: /subscribe &lt;user_id&gt; &lt;days&gt;")
         return
     try:
         target_user = int(parts[1])
@@ -1473,7 +1496,7 @@ def add_points_command(message):
         return
     parts = message.text.split()
     if len(parts) < 3:
-        bot.reply_to(message, "Usage: /addpoints <user_id> <points>")
+        bot.reply_to(message, "Usage: /addpoints &lt;user_id&gt; &lt;points&gt;")
         return
     try:
         target_user = int(parts[1])
@@ -1758,7 +1781,7 @@ def show_subscriptions(message):
         text += f"║  👤 {uid}: {remaining.days}d left\n"
     text += """║
 ╠══════════════════════════════════════╣
-║  Add sub: /subscribe <id> <days>
+║  Add sub: /subscribe &lt;id&gt; &lt;days&gt;
 ╚══════════════════════════════════════╝
 """
     bot.send_message(message.chat.id, text, parse_mode='HTML')
@@ -1929,7 +1952,7 @@ Start sharing your referral link to earn points!
 """
     for i, (referred_id, timestamp) in enumerate(ref_stats['recent'][:10], 1):
         username = _lookup_username(referred_id)
-        text += f"║  {i}. 👤 {username} ({referred_id})\n"
+        text += f"║  {i}. 👤 {esc(username)} ({referred_id})\n"
         text += f"║     🕐 {timestamp[:16]}\n"
     text += "╚══════════════════════════════════════╝"
     bot.send_message(message.chat.id, text, parse_mode='HTML')
@@ -1971,7 +1994,7 @@ def handle_document(message):
 ║      📤 <b>{BRAND_NAME}: UPLOADING</b> 📤     ║
 ╠══════════════════════════════════════╣
 ║
-║  📄 File: <code>{file_name[:25]}</code>
+║  📄 File: <code>{esc(file_name[:25])}</code>
 ║  📦 Size: {format_size(file_size)}
 ║
 """
@@ -1984,7 +2007,7 @@ def handle_document(message):
         logger.error(f"{BRAND_NAME} Download error: {e}")
         try:
             bot.edit_message_text(
-                upload_text + f"║  ❌ Download failed: {str(e)[:40]}\n╚══════════════════════════════════════╝",
+                upload_text + f"║  ❌ Download failed: {esc(str(e)[:40])}\n╚══════════════════════════════════════╝",
                 message.chat.id, progress_msg.message_id, parse_mode='HTML'
             )
         except Exception:
@@ -2055,7 +2078,7 @@ def handle_document(message):
         entry_display = entry_file if entry_file else "None found"
         success_text = upload_text + f"""║  ✅ Deployed!
 ║  📁 Files: {file_count}
-║  🎯 Entry: <code>{entry_display[:25] if entry_file else entry_display}</code>
+║  🎯 Entry: <code>{esc(entry_display[:25] if entry_file else entry_display)}</code>
 ╚══════════════════════════════════════╝
 """
         try:
@@ -2068,11 +2091,11 @@ def handle_document(message):
         shutil.rmtree(bot_folder, ignore_errors=True)
         try:
             bot.edit_message_text(
-                upload_text + f"║  ❌ Error: {str(e)[:40]}\n╚══════════════════════════════════════╝",
+                upload_text + f"║  ❌ Error: {esc(str(e)[:40])}\n╚══════════════════════════════════════╝",
                 message.chat.id, progress_msg.message_id, parse_mode='HTML'
             )
         except Exception:
-            bot.reply_to(message, f"❌ Upload failed: {str(e)[:100]}")
+            bot.reply_to(message, f"❌ Upload failed: {esc(str(e)[:100])}")
         return
 
     bot_entry = find_bot_by_id(user_id, bot_id)
@@ -2100,7 +2123,7 @@ def _deploy_and_run(bot_entry, message):
             bot.send_message(
                 message.chat.id,
                 f"❌ <b>Deployment hit an unexpected error</b> for <code>{bot_entry.get('bot_name', 'bot')}</code>:\n"
-                f"<code>{str(e)[:300]}</code>\n\nThe files are still saved — check 📂 Check Files to retry running it.",
+                f"<code>{esc(str(e)[:300])}</code>\n\nThe files are still saved — check 📂 Check Files to retry running it.",
                 parse_mode='HTML'
             )
         except Exception:
@@ -2177,7 +2200,7 @@ def handle_callback(call):
 
     except Exception as e:
         logger.error(f"{BRAND_NAME} Callback error: {e}")
-        bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:50]}")
+        bot.answer_callback_query(call.id, f"❌ Error: {esc(str(e)[:50])}")
 
 def _fake_message(call, func):
     class FakeMessage:
@@ -2225,7 +2248,7 @@ def show_referral_history(call):
     text = f"📊 <b>REFERRAL HISTORY</b>\n\n👥 Total: {ref_stats['total']}\n⭐ Points: {ref_stats['points']}\n\n<b>Recent:</b>\n"
     for i, (referred_id, timestamp) in enumerate(ref_stats['recent'][:10], 1):
         username = _lookup_username(referred_id)
-        text += f"{i}. 👤 {username} ({referred_id}) — {timestamp[:16]}\n"
+        text += f"{i}. 👤 {esc(username)} ({referred_id}) — {timestamp[:16]}\n"
 
     markup.add(types.InlineKeyboardButton("📤 Share More", callback_data="share_referral"))
     markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="refresh_points"))
@@ -2293,7 +2316,7 @@ def stop_user_bot(call, bot_id):
         cleanup_script(bot_id)
         time.sleep(1)
         bot_name = b['bot_name'] if b else bot_id
-        success_text = f"✅ <b>Stopped!</b>\n🤖 <code>{bot_name[:25]}</code>"
+        success_text = f"✅ <b>Stopped!</b>\n🤖 <code>{esc(bot_name[:25])}</code>"
         markup = types.InlineKeyboardMarkup()
         markup.add(
             types.InlineKeyboardButton("▶️ Run Again", callback_data=f"run_{bot_id}"),
@@ -2303,7 +2326,7 @@ def stop_user_bot(call, bot_id):
             bot.edit_message_text(success_text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
         except Exception:
             bot.send_message(call.message.chat.id, success_text, parse_mode='HTML', reply_markup=markup)
-        log_action(user_id, "BOT_STOP", f"Stopped {bot_name}")
+        log_action(user_id, "BOT_STOP", f"Stopped {esc(bot_name)}")
 
 def restart_user_bot(call, bot_id):
     if bot_id in bot_scripts:
@@ -2353,7 +2376,7 @@ def confirm_delete_bot(call, bot_id):
             bot.send_message(call.message.chat.id, success_text, parse_mode='HTML', reply_markup=markup)
         bot.answer_callback_query(call.id, "✅ Deleted!")
     except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:30]}")
+        bot.answer_callback_query(call.id, f"❌ Error: {esc(str(e)[:30])}")
 
 def download_user_bot(call, bot_id):
     user_id = call.from_user.id
@@ -2382,7 +2405,7 @@ def _send_bot_as_file(chat_id, b):
                 bot.send_document(chat_id, f, caption=f"📦 {b['bot_name']}.zip ({b['file_count']} files)")
             os.remove(archive_path)
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Download failed: {str(e)[:100]}")
+        bot.send_message(chat_id, f"❌ Download failed: {esc(str(e)[:100])}")
 
 def show_bot_logs(call, bot_id):
     log_path = os.path.join(LOGS_DIR, f"{bot_id}.log")
@@ -2392,7 +2415,7 @@ def show_bot_logs(call, bot_id):
     try:
         with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
             logs = f.read()[-2000:] or "No output yet..."
-        log_text = f"📋 <b>{BRAND_NAME}: LOGS</b>\n\n<code>{logs[:1800]}</code>"
+        log_text = f"📋 <b>{BRAND_NAME}: LOGS</b>\n\n<code>{esc(logs[:1800])}</code>"
         markup = types.InlineKeyboardMarkup()
         markup.add(
             types.InlineKeyboardButton("🔄 Refresh", callback_data=f"logs_{bot_id}"),
@@ -2403,7 +2426,7 @@ def show_bot_logs(call, bot_id):
         except Exception:
             bot.answer_callback_query(call.id, "📋 Logs unchanged")
     except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:30]}")
+        bot.answer_callback_query(call.id, f"❌ Error: {esc(str(e)[:30])}")
 
 def show_user_files_callback(call):
     _fake_message(call, show_user_files)
@@ -2446,7 +2469,7 @@ def show_admin_user_bots(call, target_user):
         bot.answer_callback_query(call.id, "📂 No bots!")
         return
     username = _lookup_username(target_user)
-    text = f"📂 <b>{username}'s Bots</b> (ID: {target_user})\n\nSelect one:"
+    text = f"📂 <b>{esc(username)}'s Bots</b> (ID: {target_user})\n\nSelect one:"
     markup = types.InlineKeyboardMarkup(row_width=1)
     for b in bots[:25]:
         is_running = is_bot_running_check(b['bot_id'])
@@ -2555,7 +2578,7 @@ def admin_delete_bot(call, bot_id):
         bot.send_message(call.message.chat.id, f"✅ Deleted {b['bot_name']} (owner: {owner_id})")
         show_admin_user_bots(call, owner_id)
     except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:30]}")
+        bot.answer_callback_query(call.id, f"❌ Error: {esc(str(e)[:30])}")
 
 def admin_show_bot_logs(call, bot_id):
     if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
@@ -2568,7 +2591,7 @@ def admin_show_bot_logs(call, bot_id):
     try:
         with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
             logs = f.read()[-2000:] or "No output yet..."
-        log_text = f"👑 <b>Bot Logs</b>\n\n<code>{logs[:1800]}</code>"
+        log_text = f"👑 <b>Bot Logs</b>\n\n<code>{esc(logs[:1800])}</code>"
         markup = types.InlineKeyboardMarkup()
         markup.add(
             types.InlineKeyboardButton("🔄 Refresh", callback_data=f"admin_logs_{bot_id}"),
@@ -2579,7 +2602,7 @@ def admin_show_bot_logs(call, bot_id):
         except Exception:
             bot.answer_callback_query(call.id, "📋 Logs unchanged")
     except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:30]}")
+        bot.answer_callback_query(call.id, f"❌ Error: {esc(str(e)[:30])}")
 
 def show_top_referrers(call):
     if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
@@ -2605,7 +2628,7 @@ def show_top_referrers(call):
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
         bot.answer_callback_query(call.id)
     except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ {str(e)[:30]}")
+        bot.answer_callback_query(call.id, f"❌ {esc(str(e)[:30])}")
 
 def stop_all_bots(call):
     if call.from_user.id != OWNER_ID and call.from_user.id not in admin_ids:
@@ -2647,7 +2670,7 @@ def show_admin_logs(call):
             text = "📋 No logs."
         bot.send_message(call.message.chat.id, text[:4000], parse_mode='HTML')
     except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:30]}")
+        bot.answer_callback_query(call.id, f"❌ Error: {esc(str(e)[:30])}")
 
 # ============================================
 # CLEANUP ON EXIT
