@@ -926,8 +926,21 @@ def run_bot_instance(bot_entry, message_obj, attempt=1, admin_id=None):
         return
 
     script_path = os.path.join(folder, entry_file)
+    if not os.path.exists(folder):
+        bot.send_message(
+            message_obj.chat.id,
+            f"❌ <b>{esc(bot_name)}</b>'s files are gone — this almost always means the host container "
+            f"restarted and no persistent storage (Railway Volume / Turso) is attached, so everything on "
+            f"disk got wiped. Please re-upload it. Ask your bot's operator to attach a Railway Volume so "
+            f"this stops happening.",
+            parse_mode='HTML'
+        )
+        # Clean up the now-stale record so it doesn't keep showing as a broken bot forever
+        user_bots[owner_id] = [x for x in user_bots.get(owner_id, []) if x['bot_id'] != bot_id]
+        remove_hosted_bot_db(bot_id)
+        return
     if not os.path.exists(script_path):
-        bot.send_message(message_obj.chat.id, f"❌ Entry file '{esc(entry_file)}' not found!")
+        bot.send_message(message_obj.chat.id, f"❌ Entry file '{esc(entry_file)}' not found inside <b>{esc(bot_name)}</b>'s folder (the folder exists but this specific file is missing — try re-uploading).", parse_mode='HTML')
         return
 
     if entry_type == 'py':
@@ -1064,6 +1077,121 @@ def run_bot_instance_safe(bot_entry, message_obj, attempt=1, admin_id=None):
             )
         except Exception:
             pass
+
+# ============================================
+# SELF-HEALING: STARTUP RESUME + CRASH WATCHDOG
+# ============================================
+
+class _SystemMessage:
+    """Minimal message-like stand-in so startup/watchdog code (which has no real
+    Telegram message to reply to) can reuse the exact same run flow as a normal
+    user-triggered run, and still notify the right chat."""
+    class _Chat:
+        def __init__(self, chat_id):
+            self.id = chat_id
+    def __init__(self, chat_id):
+        self.chat = self._Chat(chat_id)
+
+def resume_persisted_bots():
+    """Runs once at startup, after load_data(). If this container restarted but the
+    bot's files survived (because a persistent Volume is attached), automatically
+    bring every hosted bot back online — no manual re-upload needed. If a bot's
+    files did NOT survive (no persistent storage), notify the owner clearly and
+    clear the stale record instead of leaving a broken entry around forever."""
+    resumed, lost = 0, 0
+    for uid, bots in list(user_bots.items()):
+        for b in list(bots):
+            if not b.get('entry_file'):
+                continue
+            script_path = os.path.join(b['folder'], b['entry_file'])
+            if os.path.exists(b['folder']) and os.path.exists(script_path):
+                resumed += 1
+                threading.Thread(target=run_bot_instance_safe, args=(b, _SystemMessage(uid))).start()
+                time.sleep(0.5)  # stagger restarts instead of hammering CPU/pip/npm all at once
+            else:
+                lost += 1
+                try:
+                    bot.send_message(
+                        uid,
+                        f"⚠️ <b>{esc(b['bot_name'])}</b> was lost after a host restart — no persistent "
+                        f"storage was attached, so its files didn't survive. Please re-upload it.",
+                        parse_mode='HTML'
+                    )
+                except Exception:
+                    pass
+                user_bots[uid] = [x for x in user_bots[uid] if x['bot_id'] != b['bot_id']]
+                remove_hosted_bot_db(b['bot_id'])
+    logger.info(f"{BRAND_NAME} Startup resume: {resumed} bot(s) resumed, {lost} bot(s) lost (no persistent storage)")
+    if resumed or lost:
+        try:
+            storage = 'Turso (persistent)' if (TURSO_URL and TURSO_TOKEN) else 'Local SQLite (NOT persistent unless a Volume is attached)'
+            bot.send_message(
+                OWNER_ID,
+                f"🔄 <b>{BRAND_NAME} restarted.</b>\n"
+                f"✅ Resumed: {resumed}\n"
+                f"⚠️ Lost (re-upload needed): {lost}\n"
+                f"💾 Storage backend: {storage}\n\n"
+                + ("If bots keep getting lost on restart, attach a Railway Volume mounted at your app's working directory (see README) or switch to Turso." if lost else ""),
+                parse_mode='HTML'
+            )
+        except Exception:
+            pass
+
+bot_crash_counts = {}  # bot_id -> list of recent crash timestamps, for circuit-breaking
+WATCHDOG_INTERVAL_SECONDS = 180
+MAX_AUTO_RESTARTS_PER_HOUR = 5
+
+def bot_watchdog_loop():
+    """Background loop: every few minutes, checks every bot that's supposed to be
+    running. If one crashed on its own (not manually stopped by a user), it gets
+    auto-restarted — up to a limit per hour, so a genuinely broken bot doesn't
+    crash-loop forever and eat resources. This is the 'never goes offline
+    unexpectedly' mechanism, within honest limits."""
+    while True:
+        time.sleep(WATCHDOG_INTERVAL_SECONDS)
+        try:
+            for bot_id in list(bot_scripts.keys()):
+                if is_bot_running_check(bot_id):
+                    continue
+                info = bot_scripts.get(bot_id)
+                if not info:
+                    continue
+                owner_id = info.get('user_id')
+                bot_name = info.get('bot_name', bot_id)
+                cleanup_script(bot_id)
+
+                now = time.time()
+                crashes = bot_crash_counts.setdefault(bot_id, [])
+                crashes[:] = [t for t in crashes if now - t < 3600]
+
+                if len(crashes) >= MAX_AUTO_RESTARTS_PER_HOUR:
+                    logger.error(f"{BRAND_NAME} Watchdog: {bot_name} crashed too many times — giving up auto-restart for now")
+                    try:
+                        bot.send_message(
+                            owner_id,
+                            f"❌ <b>{esc(bot_name)}</b> has crashed {len(crashes)} times in the last hour — "
+                            f"auto-restart is pausing to avoid a crash loop. Check 📋 Logs for the real error, "
+                            f"fix it, then run it manually.",
+                            parse_mode='HTML'
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                crashes.append(now)
+                owner_bots = user_bots.get(owner_id, [])
+                b = next((x for x in owner_bots if x['bot_id'] == bot_id), None)
+                if not b or not os.path.exists(b['folder']):
+                    continue
+
+                logger.info(f"{BRAND_NAME} Watchdog: restarting crashed bot {bot_name} (attempt {len(crashes)}/{MAX_AUTO_RESTARTS_PER_HOUR} this hour)")
+                try:
+                    bot.send_message(owner_id, f"🔄 <b>{esc(bot_name)}</b> crashed — auto-restarting...", parse_mode='HTML')
+                except Exception:
+                    pass
+                threading.Thread(target=run_bot_instance_safe, args=(b, _SystemMessage(owner_id))).start()
+        except Exception as e:
+            logger.error(f"{BRAND_NAME} Watchdog loop error: {e}")
 
 # ============================================
 # KEYBOARD LAYOUTS
@@ -1618,6 +1746,35 @@ def settings_command(message):
 {START_DESCRIPTION}
 """
     bot.send_message(message.chat.id, settings_text, parse_mode='HTML')
+
+@bot.message_handler(commands=['diagnostics', 'diag'])
+@safe_command
+def diagnostics_command(message):
+    user_id = message.from_user.id
+    if user_id != OWNER_ID and user_id not in admin_ids:
+        bot.reply_to(message, f"❌ Admin only! (Your ID: <code>{user_id}</code>)", parse_mode='HTML')
+        return
+
+    storage = 'Turso (persistent ✅)' if (TURSO_URL and TURSO_TOKEN) else 'Local SQLite (⚠️ NOT persistent unless a Volume is mounted here)'
+    disk_ok = os.access(UPLOAD_BOTS_DIR, os.W_OK)
+    total_bots = sum(len(b) for b in user_bots.values())
+    running = len([k for k in bot_scripts if is_bot_running_check(k)])
+    crash_summary = ", ".join(f"{bid}: {len(times)}" for bid, times in bot_crash_counts.items() if times) or "none"
+
+    text = f"""
+🔧 <b>{BRAND_NAME} Diagnostics</b>
+
+💾 <b>Storage backend:</b> {storage}
+📁 <b>Upload dir writable:</b> {'✅' if disk_ok else '❌'}
+🤖 <b>Total hosted bots (tracked):</b> {total_bots}
+🟢 <b>Currently running:</b> {running}
+⏱️ <b>Uptime since last restart:</b> {get_uptime()}
+🔁 <b>Watchdog interval:</b> {WATCHDOG_INTERVAL_SECONDS}s, max {MAX_AUTO_RESTARTS_PER_HOUR} auto-restarts/hour per bot
+⚠️ <b>Bots with recent crashes:</b> {crash_summary}
+
+<b>What this means:</b> if the storage backend above says local SQLite/disk and you're on Railway without a Volume, everything gets wiped on every container restart — that's the #1 cause of bots disappearing after a few days. Attach a Railway Volume (mounted at this app's working directory) or configure TURSO_URL/TURSO_TOKEN to fix this permanently.
+"""
+    bot.send_message(message.chat.id, text, parse_mode='HTML')
 
 # ============================================
 # TEXT MESSAGE HANDLERS
@@ -2697,12 +2854,14 @@ def main():
 
     init_db()
     load_data()
+    resume_persisted_bots()
 
     logger.info(f"📁 Base Dir: {BASE_DIR}")
     logger.info(f"📁 Upload Dir: {UPLOAD_BOTS_DIR}")
     logger.info(f"💾 Database: {'Turso' if TURSO_URL and TURSO_TOKEN else 'Local SQLite'}")
     logger.info("=" * 50)
 
+    threading.Thread(target=bot_watchdog_loop, daemon=True).start()
     keep_alive()
     while True:
         try:
