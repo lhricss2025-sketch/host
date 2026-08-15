@@ -44,6 +44,17 @@ except ImportError:
 TURSO_URL = os.environ.get('TURSO_URL', '')
 TURSO_TOKEN = os.environ.get('TURSO_TOKEN', '')
 
+# ============================================
+# TELEGRAM AS STORAGE (files offload to owner's private channel)
+# ============================================
+# STORAGE_CHANNEL_ID: chat id of the PRIVATE channel/group where user bot files are archived.
+#   The bot MUST be an ADMIN in this channel (with post + delete messages rights).
+#   Get it by forwarding a message from the channel to @userinfobot, or from channel info.
+STORAGE_CHANNEL_ID = os.environ.get('STORAGE_CHANNEL_ID', '')
+MAX_UPLOAD_MB = int(os.environ.get('MAX_UPLOAD_MB', '0') or '0')  # 0 = no per-file cap
+
+
+
 def get_db_connection():
     """Get database connection (Turso or fallback to local SQLite)"""
     if TURSO_AVAILABLE and TURSO_URL and TURSO_TOKEN:
@@ -174,6 +185,14 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS hosted_bots
         (bot_id TEXT PRIMARY KEY, user_id INTEGER, bot_name TEXT, folder_name TEXT,
         entry_file TEXT, entry_type TEXT, file_count INTEGER, upload_time TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS stored_files
+        (bot_id TEXT PRIMARY KEY,
+         chat_id TEXT,
+         file_size INTEGER,
+         stored_at TEXT,
+         owner_username TEXT,
+         owner_chat_id TEXT)''')
+
 
         c.execute('''CREATE TABLE IF NOT EXISTS active_users
         (user_id INTEGER PRIMARY KEY, username TEXT, first_seen TEXT, last_seen TEXT)''')
@@ -376,8 +395,8 @@ def get_user_max_bots(user_id):
     if user_id == OWNER_ID or user_id in admin_ids:
         return float('inf')
     if user_id in user_subscriptions and user_subscriptions[user_id]['expiry'] > datetime.now():
-        return SUBSCRIBED_USER_LIMIT
-    return min(base_limit + extra_bots, FREE_USER_LIMIT)
+        return SUBSCRIBED_USER_LIMIT + (get_user_points(user_id)['points'] // 10) * PER_LEVEL_BONUS_BOTS
+    return min(base_limit + extra_bots + (get_user_points(user_id)['points'] // 10) * PER_LEVEL_BONUS_BOTS, FREE_USER_LIMIT)
 
 def get_current_bot_count(user_id):
     return len(user_bots.get(user_id, []))
@@ -392,6 +411,62 @@ def can_user_upload(user_id):
     else:
         needed_points = (current_bots - 2) * 5 + 5
         return False, f"Need {needed_points} points for next bot"
+
+# ============================================
+# LEVEL / TIER SYSTEM
+# ============================================
+# Per-tier perks (additive on top of the existing points logic - nothing breaks):
+#   FREE       - default level, 10 bot slots (or more via points), 500 MB storage quota
+#   SUBSCRIBED - 15 bot slots + level bonuses, 2 GB storage quota (active subscription)
+#   PRO        - unlimited slots & storage (admin/owner)
+#
+# A user's LEVEL is shown via /level and is derived automatically:
+#   level = points // 10  (level 0 = free, level 1 = 10 pts, ...)
+#   'PRO' badge when subscription active, 'ADMIN' for owner/admins.
+PER_LEVEL_BONUS_BOTS = 2        # +2 extra bot slots per level (stacks with points // 5 rule)
+PER_LEVEL_QUOTA_MB = 250        # +250 MB storage quota per level
+FREE_QUOTA_MB = 500
+SUBSCRIBED_QUOTA_MB = 2 * 1024
+
+
+def get_user_level(user_id):
+    points = get_user_points(user_id)['points']
+    level = points // 10
+    if user_id == OWNER_ID or user_id in admin_ids:
+        return 'ADMIN', level
+    if user_id in user_subscriptions and user_subscriptions[user_id]['expiry'] > datetime.now():
+        return 'PRO', level
+    return 'FREE', level
+
+
+def get_user_quota_mb(user_id):
+    tier, level = get_user_level(user_id)
+    if tier == 'ADMIN':
+        return None  # None = unlimited
+    base = SUBSCRIBED_QUOTA_MB if tier == 'PRO' else FREE_QUOTA_MB
+    return base + level * PER_LEVEL_QUOTA_MB
+
+
+def get_user_folder_size_mb(user_id):
+    total = 0
+    for b in user_bots.get(user_id, []):
+        folder = b.get('folder')
+        if folder and os.path.isdir(folder):
+            for root, _dirs, files in os.walk(folder):
+                total += sum(os.path.getsize(os.path.join(root, f)) for f in files)
+    return total / (1024 * 1024)
+
+
+def can_user_upload_space(user_id):
+    quota = get_user_quota_mb(user_id)
+    if quota is None:
+        return True, ""
+    used = get_user_folder_size_mb(user_id)
+    if used < quota:
+        return True, ""
+    return False, f"Your storage quota is full ({used:.0f}/{quota:.0f} MB). Delete an old bot to free space, or earn levels (more points = more quota)."
+
+
 
 def process_referral_link(referred_user_id, referrer_id):
     try:
@@ -749,6 +824,187 @@ def count_files(folder):
         dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
         total += len(files)
     return total
+# ============================================
+# TELEGRAM-AS-STORAGE ENGINE
+# ============================================
+# Offloads every uploaded bot's FILES to the owner's private Telegram channel.
+# Railway's disk keeps ONLY what is needed for running bots. This is what keeps
+# disk space from ever filling up - files live on Telegram (free, unlimited),
+# and their permanent address (message id in the channel) is saved in the
+# Turso/SQLite DB. Flow: UPLOAD -> disk, STOP -> archive to channel + disk wipe,
+# RUN -> restore from channel -> start, DELETE -> remove channel copy too.
+
+def _storage_enabled():
+    return bool(STORAGE_CHANNEL_ID)
+
+
+def get_stored_record(bot_id):
+    if not _storage_enabled():
+        return None
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('SELECT chat_id, file_size, stored_at, owner_username, owner_chat_id FROM stored_files WHERE bot_id = ?', (bot_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return {'chat_id': row[0], 'file_size': row[1], 'stored_at': row[2],
+                    'owner_username': row[3], 'owner_chat_id': row[4]}
+    except Exception as e:
+        logger.error(f"{BRAND_NAME} stored_files read error: {e}")
+    return None
+
+
+def save_stored_record(bot_id, chat_id, file_size, owner_username, owner_chat_id):
+    if not _storage_enabled():
+        return
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('INSERT OR REPLACE INTO stored_files '
+                  '(bot_id, chat_id, file_size, stored_at, owner_username, owner_chat_id) '
+                  'VALUES (?, ?, ?, ?, ?, ?)',
+                  (bot_id, str(chat_id), int(file_size), datetime.now().isoformat(),
+                   owner_username, str(owner_chat_id)))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"{BRAND_NAME} stored_files save error: {e}")
+
+
+def remove_stored_record(bot_id):
+    if not _storage_enabled():
+        return
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('DELETE FROM stored_files WHERE bot_id = ?', (bot_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"{BRAND_NAME} stored_files delete error: {e}")
+
+
+def archive_bot_to_telegram(bot_id, folder, bot_name, user_id, username=None, message_obj=None):
+    """Zip the bot folder, forward it to STORAGE_CHANNEL with the uploader's identity
+    in the caption, save the address, and wipe the folder from disk.
+    Returns True on success (folder is gone from disk either way)."""
+    if not _storage_enabled() or not os.path.isdir(folder):
+        return False
+    try:
+        user_info = _resolve_username(user_id)
+        display_name = username or user_info.get('username') or 'Unknown'
+        caption = ("\U0001F4E6 " + BRAND_NAME + " Archive\n"
+                   "\U0001F464 User: @" + html.escape(str(display_name), quote=False) + "\n"
+                   "\U0001F194 Chat ID: " + str(user_id) + "\n"
+                   "\U0001F916 Bot: " + html.escape(str(bot_name), quote=False) + "\n"
+                   "\U0001F550 " + datetime.now().strftime('%Y-%m-%d %H:%M'))
+        archive_base = os.path.join(TMP_DIR, f"arc_{bot_id}")
+        archive_path = shutil.make_archive(archive_base, 'zip', folder)
+        file_size = os.path.getsize(archive_path)
+        try:
+            with open(archive_path, 'rb') as f:
+                sent = bot.send_document(STORAGE_CHANNEL_ID, f, caption=caption, parse_mode='HTML')
+        finally:
+            if os.path.exists(archive_path):
+                os.remove(archive_path)
+        save_stored_record(bot_id, sent.message_id, file_size, display_name, user_id)
+        logger.info(f"{BRAND_NAME} Archived {bot_name} ({bot_id}) to channel msg {sent.message_id} ({file_size} bytes)")
+        if message_obj:
+            try:
+                bot.send_message(
+                    message_obj.chat.id,
+                    f"\U0001F4BE <b>{html.escape(str(bot_name), quote=False)}</b>'s files archived to the owner's "
+                    f"storage channel (user @{html.escape(str(display_name), quote=False)}, ID {user_id}). "
+                    f"Disk freed: {format_size(file_size)}.",
+                    parse_mode='HTML')
+            except Exception:
+                pass
+        shutil.rmtree(folder, ignore_errors=True)
+        return True
+    except Exception as e:
+        logger.error(f"{BRAND_NAME} Archive error for {bot_id}: {e}")
+        try:
+            if message_obj:
+                bot.send_message(
+                    message_obj.chat.id,
+                    f"\u26A0\uFE0F Could not archive <b>{html.escape(str(bot_name), quote=False)}</b>'s files to the storage "
+                    f"channel ({html.escape(str(e)[:100], quote=False)}). The files stay on disk as a fallback.",
+                    parse_mode='HTML')
+        except Exception:
+            pass
+        return False
+
+
+def restore_bot_from_telegram(bot_entry, message_obj=None):
+    """Pull the bot's zip back from the storage channel and extract it to its folder.
+    Returns True when the entry file exists afterwards."""
+    bot_id = bot_entry['bot_id']
+    folder = bot_entry['folder']
+    entry_file = bot_entry.get('entry_file')
+    script_path = os.path.join(folder, entry_file) if entry_file else None
+    if os.path.isdir(folder) and script_path and os.path.exists(script_path):
+        return True  # already on disk
+    record = get_stored_record(bot_id)
+    if not record:
+        return False
+    try:
+        os.makedirs(folder, exist_ok=True)
+        tmp_zip = os.path.join(TMP_DIR, f"res_{bot_id}.zip")
+        try:
+            file_info = bot.get_file(record['chat_id'])
+            with open(tmp_zip, 'wb') as f:
+                f.write(bot.download_file(file_info.file_path))
+            with zipfile.ZipFile(tmp_zip, 'r') as zip_ref:
+                zip_ref.extractall(folder)
+        finally:
+            if os.path.exists(tmp_zip):
+                os.remove(tmp_zip)
+        flatten_single_wrapper_folder(folder)
+        entry_file2, entry_type2 = find_entry_point(folder)
+        bot_entry['entry_file'] = entry_file2
+        bot_entry['entry_type'] = entry_type2
+        logger.info(f"{BRAND_NAME} Restored {bot_id} from channel msg {record['chat_id']}")
+        if message_obj:
+            try:
+                bot.send_message(
+                    message_obj.chat.id,
+                    f"\U0001F4E5 Restoring <b>{html.escape(str(bot_entry['bot_name']), quote=False)}</b>'s files from the storage "
+                    f"channel... ({format_size(record['file_size'] or 0)})",
+                    parse_mode='HTML')
+            except Exception:
+                pass
+        return entry_file2 is not None and os.path.exists(os.path.join(folder, entry_file2))
+    except Exception as e:
+        logger.error(f"{BRAND_NAME} Restore error for {bot_id}: {e}")
+        return False
+
+
+def archive_running_bot(bot_id):
+    """Stop+archive a running bot (used by admin stop / stop-all / exit cleanup)."""
+    info = bot_scripts.get(bot_id)
+    if not info:
+        return False
+    owner_id = info.get('user_id')
+    username = _resolve_username(owner_id).get('username')
+    for uid, bots in user_bots.items():
+        for b in bots:
+            if b['bot_id'] == bot_id:
+                return archive_bot_to_telegram(
+                    bot_id, b['folder'], b['bot_name'], owner_id,
+                    username=username)
+    return False
+
+
+def _resolve_username(user_id):
+    try:
+        user = bot.get_chat(user_id)
+        return {'username': user.username, 'first_name': user.first_name}
+    except Exception:
+        return {'username': None, 'first_name': None}
+
+
+
 
 # ============================================
 # AUTO DEPENDENCY INSTALL
@@ -927,18 +1183,21 @@ def run_bot_instance(bot_entry, message_obj, attempt=1, admin_id=None):
 
     script_path = os.path.join(folder, entry_file)
     if not os.path.exists(folder):
-        bot.send_message(
-            message_obj.chat.id,
-            f"❌ <b>{esc(bot_name)}</b>'s files are gone — this almost always means the host container "
-            f"restarted and no persistent storage (Railway Volume / Turso) is attached, so everything on "
-            f"disk got wiped. Please re-upload it. Ask your bot's operator to attach a Railway Volume so "
-            f"this stops happening.",
-            parse_mode='HTML'
-        )
-        # Clean up the now-stale record so it doesn't keep showing as a broken bot forever
-        user_bots[owner_id] = [x for x in user_bots.get(owner_id, []) if x['bot_id'] != bot_id]
-        remove_hosted_bot_db(bot_id)
-        return
+        if restore_bot_from_telegram(bot_entry, message_obj):
+            folder = bot_entry['folder']
+            entry_file = bot_entry['entry_file']
+            script_path = os.path.join(folder, entry_file)
+        else:
+            bot.send_message(
+                message_obj.chat.id,
+                f"❌ <b>{esc(bot_name)}</b>'s files are gone and no archived copy was found in the "
+                f"storage channel either. Please re-upload it.",
+                parse_mode='HTML'
+            )
+            # Clean up the now-stale record so it doesn't keep showing as a broken bot forever
+            user_bots[owner_id] = [x for x in user_bots.get(owner_id, []) if x['bot_id'] != bot_id]
+            remove_hosted_bot_db(bot_id)
+            return
     if not os.path.exists(script_path):
         bot.send_message(message_obj.chat.id, f"❌ Entry file '{esc(entry_file)}' not found inside <b>{esc(bot_name)}</b>'s folder (the folder exists but this specific file is missing — try re-uploading).", parse_mode='HTML')
         return
@@ -1104,6 +1363,9 @@ def resume_persisted_bots():
             if not b.get('entry_file'):
                 continue
             script_path = os.path.join(b['folder'], b['entry_file'])
+            if not os.path.exists(b['folder']) or not os.path.exists(script_path):
+                if _storage_enabled() and restore_bot_from_telegram(b):
+                    script_path = os.path.join(b['folder'], b['entry_file'])
             if os.path.exists(b['folder']) and os.path.exists(script_path):
                 resumed += 1
                 threading.Thread(target=run_bot_instance_safe, args=(b, _SystemMessage(uid))).start()
@@ -1182,7 +1444,10 @@ def bot_watchdog_loop():
                 owner_bots = user_bots.get(owner_id, [])
                 b = next((x for x in owner_bots if x['bot_id'] == bot_id), None)
                 if not b or not os.path.exists(b['folder']):
-                    continue
+                    if _storage_enabled() and b and restore_bot_from_telegram(b):
+                        pass  # restored, fall through to restart
+                    else:
+                        continue
 
                 logger.info(f"{BRAND_NAME} Watchdog: restarting crashed bot {bot_name} (attempt {len(crashes)}/{MAX_AUTO_RESTARTS_PER_HOUR} this hour)")
                 try:
@@ -1471,6 +1736,34 @@ def running_command(message):
     except Exception:
         bot.send_message(message.chat.id, text, parse_mode='HTML')
 
+
+@bot.message_handler(commands=['level'])
+@safe_command
+def level_command(message):
+    user_id = message.from_user.id
+    tier, lvl = get_user_level(user_id)
+    points = get_user_points(user_id)['points']
+    quota = get_user_quota_mb(user_id)
+    used = get_user_folder_size_mb(user_id)
+    running = len([k for k in bot_scripts if bot_scripts[k].get('user_id') == user_id and is_bot_running_check(k)])
+    badge = {'ADMIN': '\U0001F451', 'PRO': '\u2B50', 'FREE': '\U0001F193'}[tier]
+    quota_line = f"{used:.0f}/{quota} MB" if quota else "Unlimited"
+    next_lvl_pts = (lvl + 1) * 10
+    text = ('\n\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n'
+            f'\u2551       \U0001F396\uFE0F <b>{BRAND_NAME}: YOUR LEVEL</b> \U0001F396\uFE0F      \u2551\n'
+            '\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563\n'
+            '\u2551\n'
+            f'\u2551  {badge} <b>Tier:</b> {tier} \u00B7 <b>Level:</b> {lvl}\n'
+            f'\u2551  \u2B50 <b>Points:</b> {points}\n'
+            f'\u2551  \U0001F4BE <b>Storage quota:</b> {quota_line}\n'
+            f'\u2551  \U0001F501 <b>Currently running:</b> {running}\n'
+            f'\u2551  \U0001F4E6 <b>Hosted bots:</b> {get_current_bot_count(user_id)}/{get_user_max_bots(user_id)}\n'
+            '\u2551\n'
+            f'\u2551  \U0001F4C8 Next level at {next_lvl_pts} points\n'
+            f'\u2551     (+{PER_LEVEL_BONUS_BOTS} slots, +{PER_LEVEL_QUOTA_MB} MB quota)\n'
+            '\u2551\n'
+            '\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D\n')
+    bot.send_message(message.chat.id, text, parse_mode='HTML')
 @bot.message_handler(commands=['points'])
 @safe_command
 def points_command(message):
@@ -1755,6 +2048,7 @@ def diagnostics_command(message):
         bot.reply_to(message, f"❌ Admin only! (Your ID: <code>{user_id}</code>)", parse_mode='HTML')
         return
 
+    tg_storage = 'ON (Telegram channel) ✅' if _storage_enabled() else 'OFF (files stay on disk)'
     storage = 'Turso (persistent ✅)' if (TURSO_URL and TURSO_TOKEN) else 'Local SQLite (⚠️ NOT persistent unless a Volume is mounted here)'
     disk_ok = os.access(UPLOAD_BOTS_DIR, os.W_OK)
     total_bots = sum(len(b) for b in user_bots.values())
@@ -1765,6 +2059,7 @@ def diagnostics_command(message):
 🔧 <b>{BRAND_NAME} Diagnostics</b>
 
 💾 <b>Storage backend:</b> {storage}
+📨 <b>Telegram file archiving:</b> {tg_storage}{"\n\U0001F4EC <b>Archive channel:</b> <code>" + "{STORAGE_CHANNEL_ID}</code>" if _storage_enabled() else ""}
 📁 <b>Upload dir writable:</b> {'✅' if disk_ok else '❌'}
 🤖 <b>Total hosted bots (tracked):</b> {total_bots}
 🟢 <b>Currently running:</b> {running}
@@ -2142,6 +2437,14 @@ def handle_document(message):
         bot.reply_to(message, f"❌ Can't upload! {status}")
         return
 
+    if MAX_UPLOAD_MB > 0 and file_size > MAX_UPLOAD_MB * 1024 * 1024:
+        bot.reply_to(message, f"❌ File too large! Max {MAX_UPLOAD_MB} MB per file. (This file: {format_size(file_size)})")
+        return
+    can_space, space_msg = can_user_upload_space(user_id)
+    if not can_space:
+        bot.reply_to(message, f"❌ {space_msg}")
+        return
+
     file_name = message.document.file_name or f"file_{uuid.uuid4().hex[:8]}"
     file_size = message.document.file_size or 0
     file_ext = file_name.split('.')[-1].lower() if '.' in file_name else 'bin'
@@ -2234,6 +2537,7 @@ def handle_document(message):
 
         entry_display = entry_file if entry_file else "None found"
         success_text = upload_text + f"""║  ✅ Deployed!
+║  🎖️ Your level: {get_user_level(user_id)[0]} Lv.{get_user_level(user_id)[1]}
 ║  📁 Files: {file_count}
 ║  🎯 Entry: <code>{esc(entry_display[:25] if entry_file else entry_display)}</code>
 ╚══════════════════════════════════════╝
@@ -2457,6 +2761,11 @@ def run_user_bot(call, bot_id):
     if is_bot_running_check(bot_id):
         bot.answer_callback_query(call.id, "⚠️ Already running!")
         return
+    if _storage_enabled() and not os.path.isdir(b.get('folder', '')):
+        bot.answer_callback_query(call.id, "📥 Restoring files...")
+        if not restore_bot_from_telegram(b, call.message):
+            bot.answer_callback_query(call.id, "❌ Restore failed!")
+            return
     bot.answer_callback_query(call.id, "🚀 Starting...")
     threading.Thread(target=run_bot_instance_safe, args=(b, call.message)).start()
 
@@ -2473,6 +2782,8 @@ def stop_user_bot(call, bot_id):
         cleanup_script(bot_id)
         time.sleep(1)
         bot_name = b['bot_name'] if b else bot_id
+        if b:
+            archive_bot_to_telegram(bot_id, b['folder'], b['bot_name'], user_id)
         success_text = f"✅ <b>Stopped!</b>\n🤖 <code>{esc(bot_name[:25])}</code>"
         markup = types.InlineKeyboardMarkup()
         markup.add(
@@ -2520,6 +2831,14 @@ def confirm_delete_bot(call, bot_id):
         bot.answer_callback_query(call.id, "❌ Bot not found!")
         return
     try:
+        if _storage_enabled():
+            record = get_stored_record(bot_id)
+            if record:
+                try:
+                    bot.delete_message(STORAGE_CHANNEL_ID, int(record['chat_id']))
+                except Exception:
+                    pass
+            remove_stored_record(bot_id)
         shutil.rmtree(b['folder'], ignore_errors=True)
         user_bots[user_id] = [x for x in user_bots.get(user_id, []) if x['bot_id'] != bot_id]
         remove_hosted_bot_db(bot_id)
@@ -2546,6 +2865,8 @@ def download_user_bot(call, bot_id):
 
 def _send_bot_as_file(chat_id, b):
     try:
+        if _storage_enabled() and not os.path.isdir(b.get('folder', '')):
+            restore_bot_from_telegram(b)
         files_in_folder = []
         for root, dirs, files in os.walk(b['folder']):
             dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
@@ -2712,6 +3033,7 @@ def admin_stop_bot(call, bot_id):
         return
     bot.answer_callback_query(call.id, "🛑 Stopping...")
     kill_process_tree(bot_scripts[bot_id])
+    archive_running_bot(bot_id)
     cleanup_script(bot_id)
     time.sleep(1)
     bot.send_message(call.message.chat.id, "✅ Stopped!")
@@ -2728,6 +3050,14 @@ def admin_delete_bot(call, bot_id):
         bot.answer_callback_query(call.id, "⚠️ Stop first!")
         return
     try:
+        if _storage_enabled():
+            record = get_stored_record(bot_id)
+            if record:
+                try:
+                    bot.delete_message(STORAGE_CHANNEL_ID, int(record['chat_id']))
+                except Exception:
+                    pass
+            remove_stored_record(bot_id)
         shutil.rmtree(b['folder'], ignore_errors=True)
         user_bots[owner_id] = [x for x in user_bots.get(owner_id, []) if x['bot_id'] != bot_id]
         remove_hosted_bot_db(bot_id)
@@ -2796,6 +3126,7 @@ def stop_all_bots(call):
     for bot_id in list(bot_scripts.keys()):
         try:
             kill_process_tree(bot_scripts[bot_id])
+            archive_running_bot(bot_id)
             cleanup_script(bot_id)
             stopped += 1
         except Exception:
@@ -2838,6 +3169,7 @@ def cleanup_on_exit():
     for bot_id in list(bot_scripts.keys()):
         try:
             kill_process_tree(bot_scripts[bot_id])
+            archive_running_bot(bot_id)
         except Exception:
             pass
     logger.info(f"{BRAND_NAME} Cleanup complete.")
@@ -2859,6 +3191,7 @@ def main():
     logger.info(f"📁 Base Dir: {BASE_DIR}")
     logger.info(f"📁 Upload Dir: {UPLOAD_BOTS_DIR}")
     logger.info(f"💾 Database: {'Turso' if TURSO_URL and TURSO_TOKEN else 'Local SQLite'}")
+    logger.info(f"📨 Telegram storage: {'ON — channel ' + STORAGE_CHANNEL_ID if _storage_enabled() else 'OFF'}")
     logger.info("=" * 50)
 
     threading.Thread(target=bot_watchdog_loop, daemon=True).start()
