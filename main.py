@@ -1749,20 +1749,24 @@ def level_command(message):
     badge = {'ADMIN': '\U0001F451', 'PRO': '\u2B50', 'FREE': '\U0001F193'}[tier]
     quota_line = f"{used:.0f}/{quota} MB" if quota else "Unlimited"
     next_lvl_pts = (lvl + 1) * 10
-    text = ('\n\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n'
-            f'\u2551       \U0001F396\uFE0F <b>{BRAND_NAME}: YOUR LEVEL</b> \U0001F396\uFE0F      \u2551\n'
-            '\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563\n'
-            '\u2551\n'
-            f'\u2551  {badge} <b>Tier:</b> {tier} \u00B7 <b>Level:</b> {lvl}\n'
-            f'\u2551  \u2B50 <b>Points:</b> {points}\n'
-            f'\u2551  \U0001F4BE <b>Storage quota:</b> {quota_line}\n'
-            f'\u2551  \U0001F501 <b>Currently running:</b> {running}\n'
-            f'\u2551  \U0001F4E6 <b>Hosted bots:</b> {get_current_bot_count(user_id)}/{get_user_max_bots(user_id)}\n'
-            '\u2551\n'
-            f'\u2551  \U0001F4C8 Next level at {next_lvl_pts} points\n'
-            f'\u2551     (+{PER_LEVEL_BONUS_BOTS} slots, +{PER_LEVEL_QUOTA_MB} MB quota)\n'
-            '\u2551\n'
-            '\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D\n')
+    W = '\u2550' * 38
+    lines = [
+        '\u2554' + W + '\u2557',
+        '\u2551       \U0001F396\uFE0F <b>' + BRAND_NAME + ': YOUR LEVEL</b> \U0001F396\uFE0F      \u2551',
+        '\u2560' + W + '\u2563',
+        '\u2551',
+        '\u2551  ' + badge + ' <b>Tier:</b> ' + str(tier) + ' \u00B7 <b>Level:</b> ' + str(lvl),
+        '\u2551  \u2B50 <b>Points:</b> ' + str(points),
+        '\u2551  \U0001F4BE <b>Storage quota:</b> ' + str(quota_line),
+        '\u2551  \U0001F501 <b>Currently running:</b> ' + str(running),
+        '\u2551  \U0001F4E6 <b>Hosted bots:</b> ' + str(get_current_bot_count(user_id)) + '/' + str(get_user_max_bots(user_id)),
+        '\u2551',
+        '\u2551  \U0001F4C8 Next level at ' + str(next_lvl_pts) + ' points',
+        '\u2551     (+' + str(PER_LEVEL_BONUS_BOTS) + ' slots, +' + str(PER_LEVEL_QUOTA_MB) + ' MB quota)',
+        '\u2551',
+        '\u255A' + W + '\u255D',
+    ]
+    text = '\n' + '\n'.join(lines) + '\n'
     bot.send_message(message.chat.id, text, parse_mode='HTML')
 @bot.message_handler(commands=['points'])
 @safe_command
@@ -2049,6 +2053,7 @@ def diagnostics_command(message):
         return
 
     tg_storage = 'ON (Telegram channel) ✅' if _storage_enabled() else 'OFF (files stay on disk)'
+    channel_line = ('\n📬 <b>Archive channel:</b> <code>' + esc(STORAGE_CHANNEL_ID) + '</code>') if _storage_enabled() else ''
     storage = 'Turso (persistent ✅)' if (TURSO_URL and TURSO_TOKEN) else 'Local SQLite (⚠️ NOT persistent unless a Volume is mounted here)'
     disk_ok = os.access(UPLOAD_BOTS_DIR, os.W_OK)
     total_bots = sum(len(b) for b in user_bots.values())
@@ -2059,7 +2064,7 @@ def diagnostics_command(message):
 🔧 <b>{BRAND_NAME} Diagnostics</b>
 
 💾 <b>Storage backend:</b> {storage}
-📨 <b>Telegram file archiving:</b> {tg_storage}{"\n\U0001F4EC <b>Archive channel:</b> <code>" + "{STORAGE_CHANNEL_ID}</code>" if _storage_enabled() else ""}
+📨 <b>Telegram file archiving:</b> {tg_storage}{channel_line}
 📁 <b>Upload dir writable:</b> {'✅' if disk_ok else '❌'}
 🤖 <b>Total hosted bots (tracked):</b> {total_bots}
 🟢 <b>Currently running:</b> {running}
