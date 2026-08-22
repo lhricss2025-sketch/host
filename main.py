@@ -1876,7 +1876,7 @@ def subscribe_command(message):
         return
     parts = message.text.split()
     if len(parts) < 3:
-        bot.reply_to(message, "Usage: /subscribe &lt;user_id&gt; &lt;days&gt;")
+        bot.reply_to(message, "Usage: <code>/subscribe &lt;user_id&gt; &lt;days&gt;</code>", parse_mode='HTML')
         return
     try:
         target_user = int(parts[1])
@@ -1920,7 +1920,7 @@ def unsubscribe_command(message):
         return
     parts = message.text.split()
     if len(parts) < 2:
-        bot.reply_to(message, "Usage: /unsubscribe <user_id>")
+        bot.reply_to(message, "Usage: <code>/unsubscribe &lt;user_id&gt;</code>", parse_mode='HTML')
         return
     try:
         target_user = int(parts[1])
