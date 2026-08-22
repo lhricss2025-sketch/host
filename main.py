@@ -162,7 +162,11 @@ def health():
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    logger.info(f"🌐 Starting Flask keep-alive on port {port}...")
+    try:
+        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    except Exception as e:
+        logger.error(f"🌐 Flask error: {e}")
 
 def keep_alive():
     t = Thread(target=run_flask)
@@ -1352,56 +1356,41 @@ class _SystemMessage:
         self.chat = self._Chat(chat_id)
 
 def resume_persisted_bots():
-    """Runs once at startup, after load_data(). If this container restarted but the
-    bot's files survived (because a persistent Volume is attached), automatically
-    bring every hosted bot back online — no manual re-upload needed. If a bot's
-    files did NOT survive (no persistent storage), notify the owner clearly and
-    clear the stale record instead of leaving a broken entry around forever."""
-    resumed, lost = 0, 0
-    for uid, bots in list(user_bots.items()):
-        for b in list(bots):
-            if not b.get('entry_file'):
-                continue
-            script_path = os.path.join(b['folder'], b['entry_file'])
-            if not os.path.exists(b['folder']) or not os.path.exists(script_path):
-                if _storage_enabled() and restore_bot_from_telegram(b):
-                    script_path = os.path.join(b['folder'], b['entry_file'])
-            if os.path.exists(b['folder']) and os.path.exists(script_path):
-                resumed += 1
-                threading.Thread(target=run_bot_instance_safe, args=(b, _SystemMessage(uid))).start()
-                time.sleep(0.5)  # stagger restarts instead of hammering CPU/pip/npm all at once
-            else:
-                lost += 1
-                try:
-                    bot.send_message(
-                        uid,
-                        f"⚠️ <b>{esc(b['bot_name'])}</b> was lost after a host restart — no persistent "
-                        f"storage was attached, so its files didn't survive. Please re-upload it.",
-                        parse_mode='HTML'
-                    )
-                except Exception:
-                    pass
-                user_bots[uid] = [x for x in user_bots[uid] if x['bot_id'] != b['bot_id']]
-                remove_hosted_bot_db(b['bot_id'])
-    logger.info(f"{BRAND_NAME} Startup resume: {resumed} bot(s) resumed, {lost} bot(s) lost (no persistent storage)")
-    if resumed or lost:
+    logger.info(f'{BRAND_NAME} Startup resume: checking stored bots...')
+    resumed = 0
+    lost = 0
+    restored = 0
+    for uid in list(user_bots.keys()):
+        for b in list(user_bots[uid]):
+            if b.get('is_running'):
+                folder = b.get('folder', '')
+                entry = b.get('entry_file', '')
+                script_path = os.path.join(folder, entry) if folder and entry else None
+                if not (script_path and os.path.exists(script_path)) and _storage_enabled():
+                    if restore_bot_from_telegram(b):
+                        restored += 1
+                        script_path = os.path.join(folder, b.get('entry_file', ''))
+                if script_path and os.path.exists(script_path):
+                    if run_bot_instance(b['bot_id'], folder, b['entry_file'], b['entry_type'], uid, b['bot_name']):
+                        resumed += 1
+                    else:
+                        lost += 1
+                else:
+                    lost += 1
+                    b['is_running'] = False
+                    save_hosted_bot_db(b['bot_id'], uid, b['bot_name'], folder, b.get('entry_file'), b.get('entry_type'), False)
+    logger.info(f'{BRAND_NAME} Startup resume: {resumed} resumed, {restored} restored, {lost} lost')
+    if resumed or lost or restored:
         try:
-            storage = 'Turso (persistent)' if (TURSO_URL and TURSO_TOKEN) else 'Local SQLite (NOT persistent unless a Volume is attached)'
-            bot.send_message(
-                OWNER_ID,
-                f"🔄 <b>{BRAND_NAME} restarted.</b>\n"
-                f"✅ Resumed: {resumed}\n"
-                f"⚠️ Lost (re-upload needed): {lost}\n"
-                f"💾 Storage backend: {storage}\n\n"
-                + ("If bots keep getting lost on restart, attach a Railway Volume mounted at your app's working directory (see README) or switch to Turso." if lost else ""),
-                parse_mode='HTML'
-            )
+            storage = 'Turso (persistent ✅)' if (TURSO_URL and TURSO_TOKEN) else 'Local SQLite (⚠️ NOT persistent)'
+            msg = '🔄 <b>' + BRAND_NAME + ' restarted.</b>\n'
+            msg += '✅ Resumed: ' + str(resumed) + '\n'
+            msg += '📥 Restored from Channel: ' + str(restored) + '\n'
+            msg += '⚠️ Failed to Start: ' + str(lost) + '\n'
+            msg += '💾 Storage backend: ' + str(storage)
+            bot.send_message(OWNER_ID, msg, parse_mode='HTML')
         except Exception:
             pass
-
-bot_crash_counts = {}  # bot_id -> list of recent crash timestamps, for circuit-breaking
-WATCHDOG_INTERVAL_SECONDS = 180
-MAX_AUTO_RESTARTS_PER_HOUR = 5
 
 def bot_watchdog_loop():
     """Background loop: every few minutes, checks every bot that's supposed to be
@@ -1908,7 +1897,14 @@ def subscribe_command(message):
 """
     send_animated_message(message.chat.id, sub_text, "loading", duration=1)
     try:
-        bot.send_message(target_user, f"🎉 You've been subscribed for {days} days by {BRAND_NAME}!")
+        p_msg = '\u2b50 <b>PREMIUM ACTIVATED</b> \u2b50\n\n'
+        p_msg += 'Congratulations! You now have <b>PRO Tier</b> access.\n\n'
+        p_msg += '\u2551  \u2b50 <b>Tier:</b> PRO\n'
+        p_msg += '\U0001f4be <b>Storage:</b> 2GB + Bonus\n'
+        p_msg += '\U0001f916 <b>Slots:</b> 15 + Bonus\n'
+        p_msg += '\u23f0 <b>Expires:</b> ' + expiry.strftime('%Y-%m-%d %H:%M') + '\n\n'
+        p_msg += 'Use /level to see your new limits!'
+        bot.send_message(target_user, p_msg, parse_mode='HTML')
     except Exception:
         pass
 
@@ -3170,16 +3166,31 @@ def show_admin_logs(call):
 # ============================================
 
 def cleanup_on_exit():
-    logger.info(f"Cleaning up {BRAND_NAME}...")
+    logger.info(f'📢 {BRAND_NAME} Shutdown: Archiving all bots...')
     for bot_id in list(bot_scripts.keys()):
         try:
             kill_process_tree(bot_scripts[bot_id])
-            archive_running_bot(bot_id)
         except Exception:
             pass
-    logger.info(f"{BRAND_NAME} Cleanup complete.")
+    archived = 0
+    if _storage_enabled():
+        for uid in list(user_bots.keys()):
+            for b in list(user_bots[uid]):
+                folder = b.get('folder', '')
+                if os.path.isdir(folder):
+                    if archive_bot_to_telegram(b['bot_id'], folder, b['bot_name'], uid):
+                        archived += 1
+    logger.info(f'{BRAND_NAME} Shutdown complete. {archived} bots archived.')
 
 atexit.register(cleanup_on_exit)
+
+import signal
+def handle_sigterm(signum, frame):
+    logger.info("📢 SIGTERM received. Shutting down gracefully...")
+    cleanup_on_exit()
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_sigterm)
 
 # ============================================
 # MAIN
@@ -3204,7 +3215,14 @@ def main():
     while True:
         try:
             logger.info(f"🚀 Starting {BRAND_NAME} bot polling...")
-            bot.infinity_polling(timeout=60, long_polling_timeout=30)
+            bot.infinity_polling(timeout=60, long_polling_timeout=30, skip_pending=True)
+        except ApiTelegramException as e:
+            if "Conflict" in str(e) or "409" in str(e):
+                logger.error(f"⚠️ Conflict detected (409)! Another instance is running. Waiting 15s...")
+                time.sleep(15)
+            else:
+                logger.error(f"❌ Telegram API error: {e}")
+                time.sleep(5)
         except requests.exceptions.ConnectionError:
             logger.error(f"{BRAND_NAME} Connection error! Retrying...")
             time.sleep(10)
