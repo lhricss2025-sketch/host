@@ -61,14 +61,14 @@ def get_db_connection():
         try:
             if not TURSO_URL.startswith('libsql://') and not TURSO_URL.startswith('https://'):
                 # Fallback for malformed URLs
-                return sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+                return sqlite3.connect(DATABASE_PATH, check_same_thread=False, isolation_level=None)
             conn = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
             return conn
         except Exception as e:
             print(f"❌ Turso connection failed: {e}")
-            return sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            return sqlite3.connect(DATABASE_PATH, check_same_thread=False, isolation_level=None)
     else:
-        return sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        return sqlite3.connect(DATABASE_PATH, check_same_thread=False, isolation_level=None)
 
 # ============================================
 # CONFIGURATION
@@ -125,7 +125,7 @@ if not TOKEN:
     print("❌ FATAL: BOT_TOKEN environment variable is not set. Set it in Railway → Variables.")
     sys.exit(1)
 
-bot = telebot.TeleBot(TOKEN, parse_mode='HTML')
+bot = telebot.TeleBot(TOKEN, parse_mode='HTML', threaded=True, num_threads=10)
 
 # script_key (bot_id) -> {process, log_file, log_path, start_time, entry_file, entry_type, folder, user_id, bot_name}
 bot_scripts = {}
@@ -1911,6 +1911,42 @@ def subscribe_command(message):
     except Exception:
         pass
 
+@bot.message_handler(commands=['unsubscribe'])
+@safe_command
+def unsubscribe_command(message):
+    user_id = message.from_user.id
+    if user_id != OWNER_ID and user_id not in admin_ids:
+        bot.reply_to(message, "❌ Admin only!")
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: /unsubscribe <user_id>")
+        return
+    try:
+        target_user = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid user ID!")
+        return
+    
+    if target_user in user_subscriptions:
+        del user_subscriptions[target_user]
+        try:
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('DELETE FROM subscriptions WHERE user_id = ?', (target_user,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error deleting sub: {e}")
+        
+        bot.reply_to(message, f"✅ Subscription cancelled for user <code>{target_user}</code>", parse_mode='HTML')
+        try:
+            bot.send_message(target_user, "⚠️ Your Premium subscription has been cancelled by an administrator.")
+        except Exception: pass
+    else:
+        bot.reply_to(message, "❌ User has no active subscription.")
+
+
 @bot.message_handler(commands=['addpoints'])
 @safe_command
 def add_points_command(message):
@@ -3218,7 +3254,7 @@ def main():
     while True:
         try:
             logger.info(f"🚀 Starting {BRAND_NAME} bot polling...")
-            bot.infinity_polling(timeout=60, long_polling_timeout=30, skip_pending=True)
+            bot.infinity_polling(timeout=60, long_polling_timeout=20, skip_pending=True, restart_on_change=False)
         except ApiTelegramException as e:
             if "Conflict" in str(e) or "409" in str(e):
                 logger.error(f"⚠️ Conflict detected (409)! Another instance is running. Waiting 15s...")
