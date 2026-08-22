@@ -41,8 +41,8 @@ except ImportError:
     TURSO_AVAILABLE = False
     print("⚠️ Turso not installed, using local SQLite")
 
-TURSO_URL = os.environ.get('TURSO_URL', '')
-TURSO_TOKEN = os.environ.get('TURSO_TOKEN', '')
+TURSO_URL = os.environ.get('TURSO_URL', '').strip()
+TURSO_TOKEN = os.environ.get('TURSO_TOKEN', '').strip()
 
 # ============================================
 # TELEGRAM AS STORAGE (files offload to owner's private channel)
@@ -59,6 +59,9 @@ def get_db_connection():
     """Get database connection (Turso or fallback to local SQLite)"""
     if TURSO_AVAILABLE and TURSO_URL and TURSO_TOKEN:
         try:
+            if not TURSO_URL.startswith('libsql://') and not TURSO_URL.startswith('https://'):
+                # Fallback for malformed URLs
+                return sqlite3.connect(DATABASE_PATH, check_same_thread=False)
             conn = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
             return conn
         except Exception as e:
