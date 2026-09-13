@@ -19,6 +19,7 @@ import atexit
 import requests
 import uuid
 import html
+import resource
 from functools import wraps
 from flask import Flask
 from threading import Thread
@@ -113,8 +114,20 @@ def get_db_connection():
 # ============================================
 
 TOKEN = os.environ.get('BOT_TOKEN', '')
-OWNER_ID = int(os.environ.get('OWNER_ID', 8105949422))
-ADMIN_ID = int(os.environ.get('ADMIN_ID', 8105949422))
+
+def _required_int_env(name):
+    raw = os.environ.get(name, '').strip()
+    if not raw:
+        print(f'❌ FATAL: {name} environment variable is required.')
+        sys.exit(1)
+    try:
+        return int(raw)
+    except ValueError:
+        print(f'❌ FATAL: {name} must be numeric.')
+        sys.exit(1)
+
+OWNER_ID = _required_int_env('OWNER_ID')
+ADMIN_ID = int(os.environ.get('ADMIN_ID', str(OWNER_ID)))
 YOUR_USERNAME = os.environ.get('USERNAME', '@Senzo268')
 UPDATE_CHANNEL = os.environ.get('CHANNEL', 'https://telegram.me/Senzo_Official')
 
@@ -141,6 +154,9 @@ IROTECH_DIR = os.path.join(BASE_DIR, 'inf')
 DATABASE_PATH = os.path.join(IROTECH_DIR, 'bot_data.db')
 LOGS_DIR = os.path.join(BASE_DIR, 'logs')
 TMP_DIR = os.path.join(BASE_DIR, 'tmp_downloads')
+VENV_DIR_NAME = '.bot_venv'
+MAX_SINGLE_FILE_BYTES = _int_env('MAX_SINGLE_FILE_MB', 512, 1) * 1024 * 1024
+MAX_DEPENDENCY_INSTALL_MB = _int_env('MAX_DEPENDENCY_INSTALL_MB', 1024, 64) * 1024 * 1024
 
 FREE_USER_LIMIT = 10
 SUBSCRIBED_USER_LIMIT = 15
@@ -881,7 +897,29 @@ def send_spinner_animation(chat_id, text, duration=2):
 
 PY_ENTRY_CANDIDATES = ['main.py', 'bot.py', 'app.py', 'run.py', 'start.py', 'server.py']
 JS_ENTRY_CANDIDATES = ['index.js', 'bot.js', 'app.js', 'main.js', 'server.js']
-IGNORED_DIRS = {'__pycache__', 'node_modules', '.git', '.idea', '.vscode', 'venv', '.venv'}
+IGNORED_DIRS = {'__pycache__', 'node_modules', '.git', '.idea', '.vscode', 'venv', '.venv', VENV_DIR_NAME}
+
+def contains_host_secret(folder):
+    '''Reject accidental copies of this host's token; never let an upload poll this bot.'''
+    if not TOKEN:
+        return False
+    secret = TOKEN.encode('utf-8')
+    try:
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and not d.startswith('__MACOSX')]
+            for name in files:
+                path = os.path.join(root, name)
+                try:
+                    if os.path.getsize(path) > MAX_SINGLE_FILE_BYTES:
+                        continue
+                    with open(path, 'rb') as fh:
+                        if secret in fh.read():
+                            return True
+                except (OSError, UnicodeError):
+                    continue
+    except OSError:
+        return False
+    return False
 
 def safe_extract_zip(zip_path, destination):
     """Extract a ZIP without zip-slip, symlink, entry-count, or bomb surprises."""
@@ -1249,6 +1287,40 @@ TELEGRAM_MODULES = {
     'fastapi': 'fastapi',
 }
 
+def bot_venv_path(folder):
+    return os.path.join(folder, VENV_DIR_NAME)
+
+def bot_python(folder):
+    venv = bot_venv_path(folder)
+    return os.path.join(venv, 'Scripts' if os.name == 'nt' else 'bin', 'python')
+
+def ensure_bot_venv(folder):
+    venv = bot_venv_path(folder)
+    py = bot_python(folder)
+    if not os.path.isfile(py):
+        subprocess.run([sys.executable, '-m', 'venv', venv, '--clear'], check=True, timeout=60)
+    return py
+
+def get_bot_env(folder):
+    env = get_sandboxed_env()
+    env['PYTHONNOUSERSITE'] = '1'
+    env['PIP_DISABLE_PIP_VERSION_CHECK'] = '1'
+    env['PIP_NO_INPUT'] = '1'
+    env['BOT_HOST_ROOT'] = ''
+    return env
+
+def bot_resource_limits():
+    # Best-effort limits for hosted code; this is not a substitute for containers/VMs.
+    try:
+        resource.setrlimit(resource.RLIMIT_CPU, (300, 300))
+        resource.setrlimit(resource.RLIMIT_AS, (768 * 1024 * 1024, 768 * 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (2 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
+        resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
+    except (ValueError, OSError):
+        pass
+
+
 def auto_install_bulk_dependencies(folder, message_obj=None):
     """Runs once right after extraction: requirements.txt for python, package.json for node.
     Always reports back to chat when done — success, failure, or timeout — so it never looks stuck."""
@@ -1258,9 +1330,9 @@ def auto_install_bulk_dependencies(folder, message_obj=None):
             bot.send_message(message_obj.chat.id, "📦 <b>requirements.txt</b> found — installing packages, this can take a minute...", parse_mode='HTML')
         try:
             result = subprocess.run(
-                [sys.executable, '-m', 'pip', 'install', '-r', req_path, '--disable-pip-version-check', '--no-input'],
+                [ensure_bot_venv(folder), '-m', 'pip', 'install', '-r', req_path, '--disable-pip-version-check', '--no-input', '--no-cache-dir'],
                 capture_output=True, text=True, timeout=240, encoding='utf-8', errors='ignore',
-                env=get_sandboxed_env()
+                env=get_bot_env(folder)
             )
             if message_obj:
                 if result.returncode == 0:
@@ -1310,15 +1382,15 @@ def auto_install_bulk_dependencies(folder, message_obj=None):
             if message_obj:
                 bot.send_message(message_obj.chat.id, f"⚠️ npm install error: {esc(str(e)[:200])}", parse_mode='HTML')
 
-def attempt_install_pip(module_name, message):
+def attempt_install_pip(module_name, message, folder):
     package_name = TELEGRAM_MODULES.get(module_name.lower(), module_name)
     if not package_name:
         return False
     try:
         msg = send_spinner_animation(message.chat.id, f"Installing {package_name}...", duration=2)
-        command = [sys.executable, '-m', 'pip', 'install', package_name, '--disable-pip-version-check', '--no-input']
+        command = [ensure_bot_venv(folder), '-m', 'pip', 'install', package_name, '--disable-pip-version-check', '--no-input', '--no-cache-dir']
         result = subprocess.run(command, capture_output=True, text=True, check=False,
-                                encoding='utf-8', errors='ignore', timeout=150, env=get_sandboxed_env())
+                                encoding='utf-8', errors='ignore', timeout=150, env=get_bot_env(folder))
         if result.returncode == 0:
             try:
                 bot.edit_message_text(
@@ -1346,7 +1418,7 @@ def attempt_install_npm(module_name, folder, message):
         msg = send_spinner_animation(message.chat.id, f"Installing npm: {module_name}...", duration=2)
         command = ['npm', 'install', module_name, '--no-audit', '--no-fund']
         result = subprocess.run(command, capture_output=True, text=True, check=False,
-                                cwd=folder, encoding='utf-8', errors='ignore', timeout=150, env=get_sandboxed_env())
+                                cwd=folder, encoding='utf-8', errors='ignore', timeout=150, env=get_bot_env(folder))
         if result.returncode == 0:
             try:
                 bot.edit_message_text(
@@ -1461,7 +1533,7 @@ def run_bot_instance(bot_entry, message_obj, attempt=1, admin_id=None):
     log_file_path = os.path.join(LOGS_DIR, f"{bot_id}.log")
     log_file = open(log_file_path, 'w', encoding='utf-8', errors='ignore')
 
-    interpreter = [sys.executable, script_path] if entry_type == 'py' else ['node', script_path]
+    interpreter = [bot_python(folder), script_path] if entry_type == 'py' else ['node', script_path]
 
     try:
         process = subprocess.Popen(
@@ -1472,7 +1544,8 @@ def run_bot_instance(bot_entry, message_obj, attempt=1, admin_id=None):
             text=True,
             encoding='utf-8',
             errors='ignore',
-            env=get_sandboxed_env()
+            env=get_bot_env(folder),
+            preexec_fn=bot_resource_limits if os.name == 'posix' else None
         )
     except FileNotFoundError:
         log_file.close()
@@ -1526,7 +1599,7 @@ def run_bot_instance(bot_entry, message_obj, attempt=1, admin_id=None):
         if match:
             module_name = match.group(1).strip().split('.')[0]
             cleanup_script(bot_id)
-            if attempt_install_pip(module_name, message_obj):
+            if attempt_install_pip(module_name, message_obj, folder):
                 time.sleep(1)
                 run_bot_instance(bot_entry, message_obj, attempt + 1)
                 return
@@ -2780,6 +2853,8 @@ def handle_document(message):
     os.makedirs(bot_folder, exist_ok=True)
 
     try:
+        if file_size > MAX_SINGLE_FILE_BYTES:
+            raise ValueError(f'File exceeds the safety limit of {MAX_SINGLE_FILE_BYTES // (1024 * 1024)} MB')
         if file_ext == 'zip':
             tmp_zip = os.path.join(TMP_DIR, f"{bot_id}.zip")
             with open(tmp_zip, 'wb') as f:
@@ -2802,12 +2877,16 @@ def handle_document(message):
                     os.remove(tmp_zip)
 
             flatten_single_wrapper_folder(bot_folder)
+            if contains_host_secret(bot_folder):
+                raise ValueError('Upload contains this host bot token; rejected to prevent bot hijacking')
             bot_name = file_name.rsplit('.', 1)[0]
         else:
             # ANY extension is accepted and stored — .py/.js run, everything else is support data
             target_path = os.path.join(bot_folder, file_name)
             with open(target_path, 'wb') as f:
                 f.write(downloaded_file)
+            if contains_host_secret(bot_folder):
+                raise ValueError('Upload contains this host bot token; rejected to prevent bot hijacking')
             bot_name = file_name
 
         file_count = count_files(bot_folder)
