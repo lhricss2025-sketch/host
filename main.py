@@ -115,19 +115,43 @@ def get_db_connection():
 
 TOKEN = os.environ.get('BOT_TOKEN', '')
 
-def _required_int_env(name):
-    raw = os.environ.get(name, '').strip()
+def _clean_env_value(value):
+    """Normalize values copied into Railway variables without weakening validation."""
+    if value is None:
+        return ''
+    value = str(value).strip().lstrip('\ufeff')
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1].strip()
+    return value
+
+
+def _required_int_env(name, aliases=()):
+    """Read a required numeric env var, accepting common legacy spellings."""
+    names = (name,) + tuple(aliases)
+    raw = ''
+    used_name = name
+    for candidate in names:
+        candidate_value = _clean_env_value(os.environ.get(candidate))
+        if candidate_value:
+            raw = candidate_value
+            used_name = candidate
+            break
     if not raw:
-        print(f'❌ FATAL: {name} environment variable is required.')
+        print(f'❌ FATAL: {name} environment variable is required. Set {name}=your_numeric_telegram_user_id in the same Railway service/environment, then redeploy.')
         sys.exit(1)
     try:
-        return int(raw)
+        parsed = int(raw)
     except ValueError:
-        print(f'❌ FATAL: {name} must be numeric.')
+        print(f'❌ FATAL: {used_name} must contain only a numeric Telegram user ID, for example 123456789. Received an invalid value.')
         sys.exit(1)
+    if parsed <= 0:
+        print(f'❌ FATAL: {used_name} must be a positive numeric Telegram user ID.')
+        sys.exit(1)
+    return parsed
 
-OWNER_ID = _required_int_env('OWNER_ID')
-ADMIN_ID = int(os.environ.get('ADMIN_ID', str(OWNER_ID)))
+
+OWNER_ID = _required_int_env('OWNER_ID', aliases=('OWNERID', 'OWNER_USER_ID'))
+ADMIN_ID = _required_int_env('ADMIN_ID', aliases=('ADMINID', 'ADMIN_USER_ID')) if any(_clean_env_value(os.environ.get(k)) for k in ('ADMIN_ID', 'ADMINID', 'ADMIN_USER_ID')) else OWNER_ID
 YOUR_USERNAME = os.environ.get('USERNAME', '@Senzo268')
 UPDATE_CHANNEL = os.environ.get('CHANNEL', 'https://telegram.me/Senzo_Official')
 
